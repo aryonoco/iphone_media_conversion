@@ -1,0 +1,570 @@
+############################
+# Operating System Files   #
+############################
+
+### macOS ###
+.DS_Store
+**/.DS_Store
+.DS_Store?
+._*
+**/._*
+.AppleDouble
+.LSOverride
+Icon
+.DocumentRevisions-V100
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+*.icloud
+.Spotlight-V100
+.Trashes
+
+### Windows ###
+Thumbs.db
+**/Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+**/ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+**/Desktop.ini
+[Dd]esktop.ini
+$RECYCLE.BIN/
+**/$RECYCLE.BIN/
+*.stackdump
+*.url
+*.lnk
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+
+### Linux ###
+.directory
+**/.directory
+.Trash-*
+**/.Trash-*
+.nfs*
+**/.nfs*
+.fuse_hidden*
+**/.fuse_hidden*
+
+
+#########################
+# Version Control       #
+#########################
+
+### Git merge artifacts ###
+*.orig
+*.BACKUP.*
+*.BASE.*
+*.LOCAL.*
+*.REMOTE.*
+*_BACKUP_*.txt
+*_BASE_*.txt
+*_LOCAL_*.txt
+*_REMOTE_*.txt
+
+### SVN ###
+.svn/
+
+### Mercurial ###
+.hg/
+.hgignore
+.hgsigs
+.hgsub
+.hgsubstate
+.hgtags
+
+
+############################
+# IDEs & Text Editors      #
+############################
+
+### Visual Studio Code ###
+.vscode/
+.history/
+*.vsix
+
+### JetBrains IDEs ###
+.idea/
+
+### Vim/Neovim ###
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+!*.svg
+Session.vim
+Sessionx.vim
+.netrwhist
+*~
+tags
+[._]*.un~
+
+### Emacs ###
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+.org-id-locations
+*_archive
+*_flymake.*
+/eshell/history
+/eshell/lastdir
+/elpa/
+*.rel
+/auto/
+.cask/
+flycheck_*.el
+/server/
+.projectile
+.dir-locals.el
+/network-security.data
+
+### Sublime Text ###
+*.sublime-workspace
+*.sublime-project
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+
+
+##################################
+# Python                         #
+##################################
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.virtualenv/
+env.bak/
+venv.bak/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Flask stuff
+instance/
+.webassets-cache
+
+# Scrapy stuff
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Ruff
+.ruff_cache/
+
+# Pyright
+.pyright/
+
+# uv
+.uv/
+uv.lock
+
+
+##################################
+# JavaScript / Node.js           #
+##################################
+
+node_modules/
+bower_components/
+jspm_packages/
+web_modules/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# npm
+.npm
+
+# Yarn
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+.yarn-integrity
+
+# Caches
+.eslintcache
+.stylelintcache
+.parcel-cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Node REPL history
+.node_repl_history
+
+# Package files
+*.tgz
+
+# TypeScript
+*.tsbuildinfo
+
+
+##################################
+# Dagster                        #
+##################################
+
+dagster_home/
+logs/
+storage/
+.dagster/
+
+
+##################################
+# dlt                            #
+##################################
+
+.dlt/secrets.toml
+.dlt/state/
+.dlt/pipeline_state/
+.dlt/pipelines/
+
+
+##################################
+# dbt                            #
+##################################
+
+target/
+dbt_packages/
+logs/
+dbt_modules/
+
+
+##################################
+# Documentation                  #
+##################################
+
+# mkdocs
+site/
+
+
+##################################
+# Data Files                     #
+##################################
+
+# Large data file types (when outside fixtures/)
+/*.csv
+/*.xlsx
+/*.xls
+/*.parquet
+/*.avro
+/*.orc
+/*.feather
+
+# fixtures/ directory IS tracked - contains sample data for examples
+# Do not add fixtures/ to gitignore
+
+
+##################################
+# Databases                      #
+##################################
+
+*.db
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite3
+db.sqlite3-journal
+
+
+############################
+# AI/LLM Development Tools #
+############################
+
+# Anthropic / Claude
+.claude/
+.anthropic/
+CLAUDE.md
+
+# OpenAI / GPT
+.openai/
+.gpt*
+.chatgpt/
+
+# GitHub Copilot
+.copilot/
+
+# Code Assistants
+.aider*
+.cursor/
+.continue/
+.codeium*
+.tabnine*
+.kite/
+.sourcegraph/
+
+# AI Conversations & History
+.chat/
+chat-history*
+conversation-*
+.conversations/
+
+# AI/ML Development
+.models/
+.embeddings/
+.vectors/
+.checkpoints/
+.wandb/
+.mlflow/
+.tensorboard/
+
+
+##################################
+# Environment & Configuration    #
+##################################
+
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+!.env*.template
+.env.local
+.env.*.local
+
+# Local configuration
+local_config.py
+config.local.toml
+secrets.toml
+
+
+##################################
+# Azure                          #
+##################################
+
+# Azure CLI
+.azure/
+**/.azure/
+azure.json
+azureProfile.json
+
+# Azure Resource Manager
+*.parameters.local.json
+*-local.parameters.json
+local.settings.json
+
+
+##################################
+# Security & Credentials         #
+##################################
+
+# Keys & Certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.cer
+*.csr
+private_key*
+api_key*
+auth_token*
+access_token*
+credentials.json
+service-account.json
+.credentials/
+.secrets/
+
+# Tokens & Sessions
+.token
+.session
+session_store/
+sessions/
+
+
+##################################
+# Logs & Temporary Files         #
+##################################
+
+# Logs
+*.log
+*.log.*
+*.out
+*.err
+error.log
+access.log
+debug.log
+info.log
+warn.log
+nohup.out
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.original
+*_backup
+*_bak
+backup/
+backups/
+
+
+################
+# Archives     #
+################
+
+*.7z
+*.dmg
+*.gz
+*.iso
+*.rar
+*.tar
+*.zip
+*.tgz
+*.bz2
+*.xz
+
+
+##################################
+# Docker                         #
+##################################
+
+.docker/
+docker-compose.override.yml
+docker-compose.override.yaml
+
+
+################
+# Obsidian     #
+################
+
+**/.obsidian/
+**/.obsidian.vimrc
+**/.obsidian-sync.json
+**/.obsidian-sync-conflict-*
+**/.trash/
+**/*sync-conflict-*
