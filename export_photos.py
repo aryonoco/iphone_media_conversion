@@ -19,15 +19,18 @@
 """
 Photo Converter Script
 
-Processes iPhone 16/17 Pro ProRAW DNG files to lossless JPEG XL.
+Processes iPhone 16/17 Pro ProRAW DNG files to HDR JPEG XL.
 Copies other image formats (HEIC, HEIF, AVIF, JPEG, PNG) as-is with metadata.
 
-Images: DNG with JPEG XL compression -> processed to lossless .jxl
+Images: DNG with JPEG XL compression -> processed to HDR .jxl
         (uses dcraw_emu_dng with DNG SDK for full RAW processing)
         Other images and older DNGs -> copied unchanged.
 
-Output uses Rec.2020 HDR with ISO 21496-1 gain maps for adaptive HDR display.
-SDR fallback is tone-mapped and embedded as the base image.
+Output format:
+    - Color space: Rec.2020 (ITU-R BT.2020)
+    - Transfer function: PQ (SMPTE ST 2084)
+    - HDR standard: Rec.2100
+    - Peak luminance: 10,000 nits
 
 Prerequisites:
     - Run libraw_dng.py first to build dcraw_emu_dng
@@ -55,13 +58,6 @@ from typing import Final, Self
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-from jxl_gainmap import (
-    apply_srgb_gamma,
-    compute_gain_map,
-    serialize_iso21496_metadata,
-    serialize_jhgm_bundle,
-    insert_jhgm_box,
-)
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -106,14 +102,17 @@ console = Console()
 DEBUG_MODE: bool = False
 DEBUG_OUTPUT_DIR: Path | None = None
 PGTM_STRENGTH: float = 1.0  # DNG SDK uses full strength (1.0)
+EXPOSURE_OFFSET: float = 0.0  # Additional exposure offset in EV
 
 
 def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Convert iPhone ProRAW DNG files to JPEG XL with HDR gain maps.",
+        description="Convert iPhone ProRAW DNG files to HDR JPEG XL (Rec.2100 PQ).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Output format: Rec.2020 color space, PQ transfer function, 10000 nits peak.
+
 Examples:
   %(prog)s                          # Use default source/dest directories
   %(prog)s --source ~/Photos/raw    # Custom source directory
@@ -152,11 +151,19 @@ Examples:
     parser.add_argument(
         "--pgtm-strength",
         type=float,
-        default=0.5,
+        default=1.0,
         help=(
             "ProfileGainTableMap strength (0.0-1.0). Controls how strongly PGTM "
-            "local tone mapping is applied. 1.0 = full DNG spec, 0.5 = matches "
-            "Apple Photos rendering (default: 0.5)"
+            "local tone mapping is applied. 1.0 = full DNG spec (default: 1.0)"
+        ),
+    )
+    parser.add_argument(
+        "--exposure-offset",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional exposure offset in EV stops. Applied after BaselineExposure. "
+            "Use negative values to darken output (default: 0.0)"
         ),
     )
     return parser.parse_args()
@@ -434,47 +441,148 @@ def _get_baseline_exposure_ev(dng_path: Path) -> float:
         return 0.0
 
 
-def _extract_tone_curve(dng_path: Path) -> list[tuple[float, float]]:
-    """Extract ProfileToneCurve as list of (x, y) control points.
+def _extract_profile_tone_curve(dng_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    """Extract ProfileToneCurve from DNG for global tone mapping.
 
-    iPhone ProRAW DNG files contain an embedded tone curve that creates
-    the characteristic "Apple look" - shadows compressed, midtones lifted.
+    ProfileToneCurve is a 1D lookup table (257 input/output pairs) that applies
+    a contrast curve to the image. iPhone ProRAW typically includes an S-curve
+    that darkens shadows and adds contrast.
 
-    Uses exiv2 to extract the curve data (exiftool truncates large arrays).
+    The curve is stored as 514 float32 values: alternating input, output pairs.
+    Input/output values are in [0, 1] range for SDR content.
 
     Returns:
-        List of (input, output) control points, normalized 0-1.
-        Falls back to linear [(0,0), (1,1)] if extraction fails.
+        Tuple of (input_values, output_values) as numpy arrays, or None if not found.
     """
+    import struct
+
+    PROFILE_TONE_CURVE_TAG = 0xC6FC  # 50940
+
     try:
-        result = subprocess.run(
-            ["exiv2", "-pa", str(dng_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        # Parse "Exif.Image.ProfileToneCurve Float 514 0 0 0.00390625 0.0000118..."
-        for line in result.stdout.splitlines():
-            if "ProfileToneCurve" in line:
-                parts = line.split()
-                # Find the start of float values (after "Float" and count)
-                float_start = None
-                for i, p in enumerate(parts):
-                    if p == "Float":
-                        float_start = i + 2  # Skip "Float" and count
-                        break
-                if float_start is None:
-                    continue
+        with open(dng_path, "rb") as f:
+            data = f.read()
 
-                values = [float(x) for x in parts[float_start:]]
-                if len(values) >= 4:
-                    return [
-                        (values[i], values[i + 1]) for i in range(0, len(values), 2)
-                    ]
+        # Check TIFF header
+        if data[:2] == b"II":
+            fmt = "<"
+        elif data[:2] == b"MM":
+            fmt = ">"
+        else:
+            return None
 
-        return [(0.0, 0.0), (1.0, 1.0)]  # Linear fallback
-    except (subprocess.CalledProcessError, ValueError, IndexError):
-        return [(0.0, 0.0), (1.0, 1.0)]  # Linear fallback
+        # Get IFD0 offset
+        ifd_offset = struct.unpack(f"{fmt}I", data[4:8])[0]
+
+        def search_ifd(offset: int) -> tuple | None:
+            if offset < 2 or offset >= len(data) - 2:
+                return None
+
+            num_entries = struct.unpack(f"{fmt}H", data[offset : offset + 2])[0]
+            if num_entries > 1000:  # Sanity check
+                return None
+
+            for i in range(num_entries):
+                tag_offset = offset + 2 + i * 12
+                if tag_offset + 12 > len(data):
+                    break
+
+                tag_id, tag_type, count = struct.unpack(
+                    f"{fmt}HHI", data[tag_offset : tag_offset + 8]
+                )
+
+                if tag_id == PROFILE_TONE_CURVE_TAG and tag_type == 11:  # FLOAT
+                    value_offset = struct.unpack(
+                        f"{fmt}I", data[tag_offset + 8 : tag_offset + 12]
+                    )[0]
+                    floats = struct.unpack(
+                        f"{fmt}{count}f",
+                        data[value_offset : value_offset + count * 4],
+                    )
+                    inputs = np.array(floats[::2], dtype=np.float32)
+                    outputs = np.array(floats[1::2], dtype=np.float32)
+                    return inputs, outputs
+
+                # Check SubIFDs
+                if tag_id in [0x14A, 0x8769]:
+                    sub_offset = struct.unpack(
+                        f"{fmt}I", data[tag_offset + 8 : tag_offset + 12]
+                    )[0]
+                    result = search_ifd(sub_offset)
+                    if result:
+                        return result
+
+            # Check next IFD
+            next_offset = offset + 2 + num_entries * 12
+            if next_offset + 4 <= len(data):
+                next_ifd = struct.unpack(
+                    f"{fmt}I", data[next_offset : next_offset + 4]
+                )[0]
+                if next_ifd > 0:
+                    return search_ifd(next_ifd)
+
+            return None
+
+        return search_ifd(ifd_offset)
+
+    except Exception:
+        return None
+
+
+def _apply_profile_tone_curve(
+    img: np.ndarray,
+    curve_inputs: np.ndarray,
+    curve_outputs: np.ndarray,
+) -> np.ndarray:
+    """Apply ProfileToneCurve to image data in a hue-preserving manner.
+
+    The tone curve is applied to luminance only, then all RGB channels are
+    scaled by the same ratio (new_luminance / old_luminance). This preserves
+    the original R:G:B ratios while still applying the curve's contrast.
+
+    For HDR content (luminance > 1.0), the curve is extended linearly using
+    the slope at the endpoint to preserve HDR headroom.
+
+    Args:
+        img: Linear RGB image (H, W, 3), may contain values > 1.0 for HDR.
+        curve_inputs: Input values for the tone curve (0-1 range).
+        curve_outputs: Output values for the tone curve.
+
+    Returns:
+        Tone-mapped image with curve applied, hue preserved.
+    """
+    # Create interpolator for smooth curve
+    interp = PchipInterpolator(curve_inputs, curve_outputs, extrapolate=False)
+
+    # Get endpoint slope for HDR extension
+    endpoint_slope = (curve_outputs[-1] - curve_outputs[-2]) / (
+        curve_inputs[-1] - curve_inputs[-2] + 1e-10
+    )
+
+    # Compute luminance from RGB (Rec.709 coefficients as perceptual approximation)
+    lum = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
+
+    # Apply curve to luminance
+    lum_curved = np.zeros_like(lum)
+
+    # SDR range: use interpolated curve
+    sdr_mask = (lum >= 0) & (lum <= 1.0)
+    lum_curved[sdr_mask] = interp(lum[sdr_mask])
+
+    # HDR range: linear extension
+    hdr_mask = lum > 1.0
+    lum_curved[hdr_mask] = curve_outputs[-1] + endpoint_slope * (lum[hdr_mask] - 1.0)
+
+    # Negative luminance (shouldn't happen but be safe)
+    lum_curved[lum < 0] = 0.0
+
+    # Scale RGB by luminance ratio to preserve hue
+    # Add small epsilon to avoid division by zero for black pixels
+    scale = lum_curved / (lum + 1e-10)
+    scale = scale[:, :, np.newaxis]  # Broadcast to (H, W, 1) for RGB
+
+    result = img * scale
+
+    return result.astype(np.float32)
 
 
 def _extract_profile_gain_table_map(dng_path: Path) -> dict | None:
@@ -548,154 +656,6 @@ def _extract_profile_gain_table_map(dng_path: Path) -> dict | None:
         return None
 
 
-def _apply_profile_gain_table_map(
-    ppm_path: Path,
-    pgtm: dict,
-    baseline_exposure: float = 1.0,
-) -> None:
-    """Apply ProfileGainTableMap local tone mapping to PPM image.
-
-    Implements DNG SDK algorithm from dng_reference.cpp lines 3260-3460:
-    1. Calculate weight = sum(input_weights[i] * component[i]) for each pixel
-       Components: R, G, B, min(R,G,B), max(R,G,B)
-    2. Scale weight by BaselineExposure
-    3. Interpolate gain from 3D table using (row, col, weight)
-    4. Multiply pixel RGB by gain
-
-    This creates spatially-varying local tone mapping - different regions
-    of the image get different tonal adjustments.
-
-    Args:
-        ppm_path: Path to 16-bit PPM file (modified in place).
-        pgtm: Dictionary from _extract_profile_gain_table_map().
-        baseline_exposure: Linear exposure multiplier (2^BaselineExposureEV).
-    """
-    from scipy.interpolate import RegularGridInterpolator
-
-    # Read PPM
-    with open(ppm_path, "rb") as f:
-        magic = f.readline()
-        if magic.strip() != b"P6":
-            raise ValueError(f"Not a binary PPM file: {ppm_path}")
-
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        dims = line.decode().split()
-        width, height = int(dims[0]), int(dims[1])
-
-        maxval_line = f.readline()
-        maxval = int(maxval_line.decode().strip())
-        data = f.read()
-
-    if maxval != 65535:
-        raise ValueError(f"Expected 16-bit PPM (maxval 65535), got {maxval}")
-
-    # Parse image data
-    img = np.frombuffer(data, dtype=">u2").reshape(height, width, 3).astype(np.float32)
-
-    # Normalize to 0-1 range for weight calculation
-    img_norm = img / 65535.0
-
-    # Extract PGTM parameters
-    points_v = pgtm["points_v"]
-    points_h = pgtm["points_h"]
-    num_table_points = pgtm["num_table_points"]
-    spacing_v = pgtm["spacing_v"]
-    spacing_h = pgtm["spacing_h"]
-    origin_v = pgtm["origin_v"]
-    origin_h = pgtm["origin_h"]
-    input_weights = np.array(pgtm["input_weights"])  # (R, G, B, min, max)
-    table = pgtm["table"]  # Shape: (V, H, N)
-
-    # Calculate weight per pixel (DNG SDK algorithm)
-    # weight = w[0]*R + w[1]*G + w[2]*B + w[3]*min(RGB) + w[4]*max(RGB)
-    r, g, b = img_norm[:, :, 0], img_norm[:, :, 1], img_norm[:, :, 2]
-    rgb_min = np.minimum(np.minimum(r, g), b)
-    rgb_max = np.maximum(np.maximum(r, g), b)
-
-    weight = (
-        input_weights[0] * r
-        + input_weights[1] * g
-        + input_weights[2] * b
-        + input_weights[3] * rgb_min
-        + input_weights[4] * rgb_max
-    )
-
-    # Scale by baseline exposure and clamp to [0, 1]
-    # (DNG SDK dng_reference.cpp:3385 multiplies weight by exposureWeightGain)
-    weight = np.clip(weight * baseline_exposure, 0.0, 1.0)
-
-    # Map weight (0-1) to table index per DNG SDK (dng_reference.cpp:3399):
-    # weightScaled = weight * tableSize (NOT tableSize-1)
-    # Then clamp index to valid range [0, tableSize-1]
-    weight_idx = weight * num_table_points
-    weight_idx = np.clip(weight_idx, 0, num_table_points - 1)
-
-    # Create pixel coordinates with half-pixel offset for center sampling
-    # (DNG SDK dng_reference.cpp:3326-3327: y = top + 0.5f, x = left + 0.5f)
-    rows = np.arange(height, dtype=np.float32) + 0.5
-    cols = np.arange(width, dtype=np.float32) + 0.5
-
-    # Normalize to 0-1 image coordinates
-    # (DNG SDK dng_reference.cpp:3338-3339)
-    v_image = rows / height
-    u_image = cols / width
-
-    # Apply origin and spacing transformation to get map coordinates
-    # (DNG SDK dng_reference.cpp:3343-3344: x_map = (u_image - origin) / spacing)
-    row_coords = (v_image - origin_v) / spacing_v
-    col_coords = (u_image - origin_h) / spacing_h
-
-    # Clamp to valid table range
-    # (DNG SDK dng_reference.cpp:3348-3349)
-    row_coords = np.clip(row_coords, 0, points_v - 1)
-    col_coords = np.clip(col_coords, 0, points_h - 1)
-
-    # Create coordinate grids
-    row_grid, col_grid = np.meshgrid(row_coords, col_coords, indexing="ij")
-
-    # Build interpolator for 3D table
-    v_axis = np.arange(points_v)
-    h_axis = np.arange(points_h)
-    n_axis = np.arange(num_table_points)
-    interp = RegularGridInterpolator(
-        (v_axis, h_axis, n_axis),
-        table,
-        method="linear",
-        bounds_error=False,
-        fill_value=1.0,  # Gain of 1.0 for out-of-bounds
-    )
-
-    # Stack coordinates for interpolation: (height, width) -> (height*width, 3)
-    coords = np.stack([row_grid.ravel(), col_grid.ravel(), weight_idx.ravel()], axis=1)
-
-    # Interpolate gains
-    gains = interp(coords).reshape(height, width)
-
-    # Scale gains by PGTM_STRENGTH (0.5 matches Apple Photos rendering)
-    # scaled_gain = 1.0 + (gain - 1.0) * strength
-    # At strength=1.0: full DNG spec gains
-    # At strength=0.5: halfway between gain and 1.0 (matches Apple)
-    # At strength=0.0: all gains become 1.0 (no PGTM effect)
-    scaled_gains = 1.0 + (gains - 1.0) * PGTM_STRENGTH
-
-    # Apply scaled gain to all channels
-    img[:, :, 0] *= scaled_gains
-    img[:, :, 1] *= scaled_gains
-    img[:, :, 2] *= scaled_gains
-
-    # Clamp and convert back to big-endian 16-bit
-    img = np.clip(img, 0, 65535).astype(">u2")
-
-    # Write PPM back
-    with open(ppm_path, "wb") as f:
-        f.write(magic)
-        f.write(f"{width} {height}\n".encode())
-        f.write(f"{maxval}\n".encode())
-        f.write(img.tobytes())
-
-
 def _compute_pgtm_gains(
     img: np.ndarray,
     pgtm: dict[str, Any],
@@ -745,10 +705,14 @@ def _compute_pgtm_gains(
         + input_weights[3] * rgb_min
         + input_weights[4] * rgb_max
     )
-    # Scale weight by baseline exposure per DNG SDK (dng_reference.cpp:3385)
-    # exposureWeightGain = pow(2.0, fBaselineExposure)
+    # DNG SDK scales weight by 2^BaselineExposure, but this can cause weight
+    # saturation for extreme exposure images. We cap the scaling factor to
+    # prevent complete saturation while still adjusting for exposure level.
+    MAX_WEIGHT_SCALE = 4.0  # Cap at 2 EV of adjustment
     if baseline_exposure_ev != 0.0:
         exposure_weight_gain = 2.0 ** baseline_exposure_ev
+        # Cap the scaling to prevent saturation
+        exposure_weight_gain = min(exposure_weight_gain, MAX_WEIGHT_SCALE)
         weight = weight * exposure_weight_gain
     # Clamp weight to valid table range (but don't clamp the pixel values)
     weight = np.clip(weight, 0.0, 1.0)
@@ -787,7 +751,7 @@ def _compute_pgtm_gains(
 
 
 def _convert_prophoto_to_rec2020(img: np.ndarray) -> np.ndarray:
-    """Convert linear ProPhoto RGB to linear Rec.2020.
+    """Convert linear ProPhoto RGB to linear Rec.2020 with gamut mapping.
 
     ProPhoto RGB (RIMM/ROMM) is the DNG SDK's working color space.
     This function converts to Rec.2020 for output encoding.
@@ -796,6 +760,9 @@ def _convert_prophoto_to_rec2020(img: np.ndarray) -> np.ndarray:
     1. ProPhoto RGB → XYZ (D50 white point)
     2. Bradford chromatic adaptation D50 → D65
     3. XYZ → Rec.2020 (D65 white point)
+
+    For out-of-gamut colors (negative RGB values after conversion), uses
+    luminance-preserving desaturation toward neutral to maintain hue.
 
     Args:
         img: Linear ProPhoto RGB image as float32 array (H, W, 3)
@@ -811,317 +778,86 @@ def _convert_prophoto_to_rec2020(img: np.ndarray) -> np.ndarray:
         [0.0000000, 0.0000000, 1.2256520],
     ], dtype=np.float32)
 
+    # Rec.2020 luminance coefficients (ITU-R BT.2020)
+    lum_coeffs = np.array([0.2627, 0.6780, 0.0593], dtype=np.float32)
+
     h, w, c = img.shape
     flat = img.reshape(-1, 3)
     converted = flat @ matrix.T
-    # Clip negative values (ProPhoto gamut is larger than Rec.2020)
-    converted = np.clip(converted, 0.0, None)
+
+    # Find pixels with negative channels (out of Rec.2020 gamut)
+    min_vals = np.min(converted, axis=1)
+    out_of_gamut = min_vals < 0
+
+    if np.any(out_of_gamut):
+        # Calculate luminance for out-of-gamut pixels
+        lum = (converted[out_of_gamut] @ lum_coeffs)[:, np.newaxis]
+
+        # Desaturate toward neutral until in gamut
+        # Solve for t: lum + t*(rgb - lum) >= 0 for all channels
+        rgb_oog = converted[out_of_gamut]
+
+        # For each channel, find t that brings it to 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            diff = lum - rgb_oog
+            t = np.where(diff > 0, lum / diff, 1.0)
+            t_max = np.min(np.where(rgb_oog < 0, t, 1.0), axis=1, keepdims=True)
+
+        # Apply desaturation
+        converted[out_of_gamut] = lum + t_max * (rgb_oog - lum)
+
+        # Clean up floating point errors
+        converted[out_of_gamut] = np.maximum(converted[out_of_gamut], 0.0)
+
     return converted.reshape(h, w, 3).astype(np.float32)
 
 
-def _build_tone_curve_lut(
-    points: list[tuple[float, float]], bits: int = 16
-) -> np.ndarray:
-    """Build lookup table using monotonic cubic interpolation.
+def _apply_pq_oetf(linear_nits: np.ndarray) -> np.ndarray:
+    """Apply PQ (SMPTE ST 2084) OETF.
 
-    Uses PCHIP (Piecewise Cubic Hermite Interpolating Polynomial) for
-    smooth monotonic interpolation that won't overshoot the control points.
+    Encodes absolute luminance (0-10000 nits) to PQ signal (0-1).
+    This is the standard transfer function for HDR content per ITU-R BT.2100.
 
     Args:
-        points: List of (input, output) control points, normalized 0-1.
-        bits: Output bit depth (default 16 for 16-bit PPM).
+        linear_nits: Linear light values in nits (0-10000 range)
 
     Returns:
-        Lookup table as uint16 array with 2^bits entries.
+        PQ-encoded values (0-1 range)
     """
-    x = np.array([p[0] for p in points])
-    y = np.array([p[1] for p in points])
+    # PQ constants per SMPTE ST 2084
+    m1 = 0.1593017578125    # 2610 / 16384
+    m2 = 78.84375           # 2523 / 32 * 128
+    c1 = 0.8359375          # 3424 / 4096
+    c2 = 18.8515625         # 2413 / 128
+    c3 = 18.6875            # 2392 / 128
 
-    # PCHIP = Piecewise Cubic Hermite Interpolating Polynomial (monotonic)
-    interp = PchipInterpolator(x, y)
+    # Normalize to 0-1 range (10000 nits = 1.0)
+    L = np.clip(linear_nits / 10000.0, 0.0, 1.0)
 
-    max_val = (1 << bits) - 1
-    lut_x = np.linspace(0, 1, max_val + 1)
-    lut_y = np.clip(interp(lut_x), 0, 1)
+    # PQ OETF: E' = ((c1 + c2*L^m1) / (1 + c3*L^m1))^m2
+    L_m1 = np.power(L, m1)
+    numerator = c1 + c2 * L_m1
+    denominator = 1.0 + c3 * L_m1
+    pq = np.power(numerator / denominator, m2)
 
-    return (lut_y * max_val).astype(np.uint16)
+    return pq.astype(np.float32)
 
 
-def _apply_tone_curve_to_ppm(ppm_path: Path, lut: np.ndarray) -> None:
-    """Apply tone curve using DNG SDK's max/min interpolation method.
+def _scale_to_nits(linear_normalized: np.ndarray, sdr_white_nits: float = 203.0) -> np.ndarray:
+    """Scale normalized linear values to absolute nits for PQ encoding.
 
-    The DNG SDK algorithm (from dng_reference.cpp RefBaselineRGBTone):
-    1. For each pixel, identify max, mid, min RGB values
-    2. Apply curve to max and min only
-    3. Interpolate mid: mid' = min' + (max' - min') * (mid - min) / (max - min)
-
-    This preserves hue by maintaining the ratio between RGB values,
-    which is more accurate than luminance-based scaling.
+    Per ITU-R BT.2408, SDR reference white = 203 nits.
+    Scene-referred values can exceed 1.0 for HDR highlights,
+    which will map to values above 203 nits.
 
     Args:
-        ppm_path: Path to 16-bit PPM file (modified in place).
-        lut: Lookup table from _build_tone_curve_lut().
+        linear_normalized: Linear values where 1.0 = SDR white
+        sdr_white_nits: SDR reference white in nits (default: 203 per BT.2408)
+
+    Returns:
+        Linear values in nits (0 to 10000+ range)
     """
-    # Read PPM header and data
-    with open(ppm_path, "rb") as f:
-        magic = f.readline()
-        if magic.strip() != b"P6":
-            raise ValueError(f"Not a binary PPM file: {ppm_path}")
-
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        dims = line.decode().split()
-        width, height = int(dims[0]), int(dims[1])
-
-        maxval_line = f.readline()
-        maxval = int(maxval_line.decode().strip())
-
-        data = f.read()
-
-    if maxval != 65535:
-        raise ValueError(f"Expected 16-bit PPM (maxval 65535), got {maxval}")
-
-    # Parse as big-endian 16-bit unsigned integers
-    img = np.frombuffer(data, dtype=">u2").reshape(height, width, 3).astype(np.float32)
-
-    r = img[:, :, 0]
-    g = img[:, :, 1]
-    b = img[:, :, 2]
-
-    # Allocate output arrays
-    rr = np.empty_like(r)
-    gg = np.empty_like(g)
-    bb = np.empty_like(b)
-
-    # Helper to apply curve via LUT (input 0-65535, output 0-65535)
-    def curve(x: np.ndarray) -> np.ndarray:
-        return lut[np.clip(x, 0, 65535).astype(np.uint16)].astype(np.float32)
-
-    # DNG SDK algorithm: apply curve to max and min, interpolate mid
-    # We need to handle 8 cases based on RGB ordering
-
-    # Find max and min per pixel
-    rgb_max = np.maximum(np.maximum(r, g), b)
-    rgb_min = np.minimum(np.minimum(r, g), b)
-
-    # Apply curve to max and min
-    max_curved = curve(rgb_max)
-    min_curved = curve(rgb_min)
-
-    # Compute the interpolation factor for middle value
-    # mid' = min' + (max' - min') * (mid - min) / (max - min)
-    # Handle division by zero when max == min (grayscale pixels)
-    range_orig = rgb_max - rgb_min
-    range_curved = max_curved - min_curved
-
-    # For grayscale pixels (max == min), all outputs are the same
-    grayscale_mask = range_orig < 1e-6
-
-    # Case 1: r >= g >= b (r is max, b is min, g is mid)
-    case1 = (r >= g) & (g >= b) & ~grayscale_mask
-    if np.any(case1):
-        t = np.zeros_like(r)
-        np.divide(g - b, range_orig, out=t, where=case1)
-        rr[case1] = max_curved[case1]
-        bb[case1] = min_curved[case1]
-        gg[case1] = min_curved[case1] + range_curved[case1] * t[case1]
-
-    # Case 2: r >= b > g (r is max, g is min, b is mid)
-    case2 = (r >= b) & (b > g) & ~grayscale_mask
-    if np.any(case2):
-        t = np.zeros_like(r)
-        np.divide(b - g, range_orig, out=t, where=case2)
-        rr[case2] = max_curved[case2]
-        gg[case2] = min_curved[case2]
-        bb[case2] = min_curved[case2] + range_curved[case2] * t[case2]
-
-    # Case 3: g > r >= b (g is max, b is min, r is mid)
-    case3 = (g > r) & (r >= b) & ~grayscale_mask
-    if np.any(case3):
-        t = np.zeros_like(r)
-        np.divide(r - b, range_orig, out=t, where=case3)
-        gg[case3] = max_curved[case3]
-        bb[case3] = min_curved[case3]
-        rr[case3] = min_curved[case3] + range_curved[case3] * t[case3]
-
-    # Case 4: g >= b > r (g is max, r is min, b is mid)
-    case4 = (g >= b) & (b > r) & ~grayscale_mask
-    if np.any(case4):
-        t = np.zeros_like(r)
-        np.divide(b - r, range_orig, out=t, where=case4)
-        gg[case4] = max_curved[case4]
-        rr[case4] = min_curved[case4]
-        bb[case4] = min_curved[case4] + range_curved[case4] * t[case4]
-
-    # Case 5: b > g > r (b is max, r is min, g is mid)
-    case5 = (b > g) & (g > r) & ~grayscale_mask
-    if np.any(case5):
-        t = np.zeros_like(r)
-        np.divide(g - r, range_orig, out=t, where=case5)
-        bb[case5] = max_curved[case5]
-        rr[case5] = min_curved[case5]
-        gg[case5] = min_curved[case5] + range_curved[case5] * t[case5]
-
-    # Case 6: b > r >= g (b is max, g is min, r is mid)
-    case6 = (b > r) & (r >= g) & ~grayscale_mask
-    if np.any(case6):
-        t = np.zeros_like(r)
-        np.divide(r - g, range_orig, out=t, where=case6)
-        bb[case6] = max_curved[case6]
-        gg[case6] = min_curved[case6]
-        rr[case6] = min_curved[case6] + range_curved[case6] * t[case6]
-
-    # Grayscale case: all channels get the same curved value
-    if np.any(grayscale_mask):
-        curved_val = curve(r)  # r == g == b for grayscale
-        rr[grayscale_mask] = curved_val[grayscale_mask]
-        gg[grayscale_mask] = curved_val[grayscale_mask]
-        bb[grayscale_mask] = curved_val[grayscale_mask]
-
-    # Store results back
-    img[:, :, 0] = rr
-    img[:, :, 1] = gg
-    img[:, :, 2] = bb
-
-    # Clamp and convert back to big-endian 16-bit
-    img = np.clip(img, 0, 65535).astype(">u2")
-
-    # Write PPM back
-    with open(ppm_path, "wb") as f:
-        f.write(magic)
-        f.write(f"{width} {height}\n".encode())
-        f.write(f"{maxval}\n".encode())
-        f.write(img.tobytes())
-
-
-def _apply_display_gamma(ppm_path: Path) -> None:
-    """Apply sRGB transfer function for display encoding.
-
-    When dcraw outputs linear data (-g 1 1), we need to apply the sRGB/Display P3
-    transfer function before saving to JXL with an embedded Display P3 profile.
-
-    The sRGB transfer function is:
-    - Linear region: out = 12.92 * in, for in <= 0.0031308
-    - Gamma region: out = 1.055 * in^(1/2.4) - 0.055, for in > 0.0031308
-
-    Args:
-        ppm_path: Path to 16-bit linear PPM file (modified in place).
-    """
-    # Read PPM header and data
-    with open(ppm_path, "rb") as f:
-        magic = f.readline()
-        if magic.strip() != b"P6":
-            raise ValueError(f"Not a binary PPM file: {ppm_path}")
-
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        dims = line.decode().split()
-        width, height = int(dims[0]), int(dims[1])
-
-        maxval_line = f.readline()
-        maxval = int(maxval_line.decode().strip())
-
-        data = f.read()
-
-    if maxval != 65535:
-        raise ValueError(f"Expected 16-bit PPM (maxval 65535), got {maxval}")
-
-    # Parse as big-endian 16-bit unsigned integers
-    img = np.frombuffer(data, dtype=">u2").reshape(height, width, 3).astype(np.float32)
-
-    # Normalize to 0-1 range
-    img = img / 65535.0
-
-    # Apply sRGB transfer function
-    # Linear region: out = 12.92 * in
-    # Gamma region: out = 1.055 * in^(1/2.4) - 0.055
-    linear_threshold = 0.0031308
-    linear_mask = img <= linear_threshold
-    img = np.where(
-        linear_mask,
-        12.92 * img,
-        1.055 * np.power(np.maximum(img, 1e-10), 1.0 / 2.4) - 0.055,
-    )
-
-    # Convert back to 16-bit
-    img = np.clip(img * 65535.0, 0, 65535).astype(">u2")
-
-    # Write PPM back
-    with open(ppm_path, "wb") as f:
-        f.write(magic)
-        f.write(f"{width} {height}\n".encode())
-        f.write(f"{maxval}\n".encode())
-        f.write(img.tobytes())
-
-
-def _apply_exposure_ramp(ppm_path: Path, exposure_ev: float) -> None:
-    """Apply BaselineExposure as a linear multiplier with clipping.
-
-    This function applies exposure BEFORE PGTM in this pipeline. While the
-    DNG SDK applies exposure after PGTM, the two approaches are mathematically
-    equivalent when PGTM weight scaling compensates for the order difference.
-
-    The exposure ramp is: output = clamp(input * 2^exposure, 0, 1)
-
-    For positive exposure:
-    - white_point = 1.0 / 2^exposure
-    - Pixels at white_point map to 1.0 (new white)
-    - Pixels above white_point clip to 1.0
-
-    Note: For HDR pipelines, capture scene-referred data BEFORE calling this
-    function, as clipping destroys highlight headroom needed for gain maps.
-
-    Args:
-        ppm_path: Path to 16-bit linear PPM file (modified in place).
-        exposure_ev: Exposure value in EV stops.
-    """
-    if abs(exposure_ev) < 0.001:
-        return  # No exposure adjustment needed
-
-    # Read PPM header and data
-    with open(ppm_path, "rb") as f:
-        magic = f.readline()
-        if magic.strip() != b"P6":
-            raise ValueError(f"Not a binary PPM file: {ppm_path}")
-
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        dims = line.decode().split()
-        width, height = int(dims[0]), int(dims[1])
-
-        maxval_line = f.readline()
-        maxval = int(maxval_line.decode().strip())
-
-        data = f.read()
-
-    if maxval != 65535:
-        raise ValueError(f"Expected 16-bit PPM (maxval 65535), got {maxval}")
-
-    # Parse as big-endian 16-bit unsigned integers
-    img = np.frombuffer(data, dtype=">u2").reshape(height, width, 3).astype(np.float32)
-
-    # Normalize to 0-1 range
-    img = img / 65535.0
-
-    # Apply exposure as linear multiplier (DNG SDK's exposure ramp)
-    exposure_mult = 2.0**exposure_ev
-    img = img * exposure_mult
-
-    # Clip to valid range (hard clipping like DNG SDK)
-    img = np.clip(img, 0.0, 1.0)
-
-    # Convert back to 16-bit
-    img = (img * 65535.0).astype(">u2")
-
-    # Write PPM back
-    with open(ppm_path, "wb") as f:
-        f.write(magic)
-        f.write(f"{width} {height}\n".encode())
-        f.write(f"{maxval}\n".encode())
-        f.write(img.tobytes())
+    return linear_normalized * sdr_white_nits
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1234,16 +970,6 @@ def _write_ppm_from_float(ppm_path: Path, img: np.ndarray, width: int, height: i
         f.write(img_out.tobytes())
 
 
-def _write_pgm_from_uint8(pgm_path: Path, img: np.ndarray) -> None:
-    """Write uint8 grayscale array as 8-bit PGM."""
-    height, width = img.shape
-    with open(pgm_path, "wb") as f:
-        f.write(b"P5\n")
-        f.write(f"{width} {height}\n".encode())
-        f.write(b"255\n")
-        f.write(img.tobytes())
-
-
 def _save_debug_stage(
     ppm_path: Path,
     stage_name: str,
@@ -1313,44 +1039,45 @@ def _save_debug_stage(
 
 
 def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
-    """Process iPhone ProRAW DNG to JXL with HDR support and ISO 21496-1 gain map.
+    """Process iPhone ProRAW DNG to HDR JPEG XL with PQ transfer function.
 
-    Implements the full DNG SDK rendering pipeline plus HDR gain map generation:
+    Implements the DNG SDK rendering pipeline for true HDR output:
 
     Phase 1 (dcraw_emu_dng):
     - Decode JXL-compressed Linear Raw data via DNG SDK
     - Demosaic Bayer pattern to RGB using AHD algorithm
-    - Apply color matrix for Rec.2020 output
-    - Output 16-bit linear PPM
+    - Output 16-bit linear ProPhoto RGB PPM
 
     Phase 2 (ProfileGainTableMap):
     - Apply DNG 1.6 local tone mapping for spatially-varying adjustments
-    - Creates characteristic "Apple look" with lifted shadows
+    - Preserves full HDR dynamic range (no clipping)
 
     Phase 3 (Exposure):
     - Apply BaselineExposure correction after PGTM (DNG SDK order)
+    - Scene-referred data preserved without clipping
 
-    Phase 4 (HDR Pipeline):
-    - Save post-exposure linear data as TRUE HDR reference (scene-referred)
-    - Apply ProfileToneCurve from DNG for SDR rendering (Apple's look)
-    - Compute gain map from HDR/SDR luminance ratios
-    - Apply sRGB gamma to SDR for display encoding
-    - Encode SDR base as lossless JXL container (Rec.2020 + sRGB transfer)
-    - Encode gain map as lossless naked JXL codestream
-    - Insert jhgm box via container surgery
+    Phase 3.5 (ProfileToneCurve):
+    - Apply global S-curve for contrast (darkens shadows)
+    - HDR values > 1.0 extended linearly to preserve headroom
 
-    The gain map enables HDR reconstruction on HDR displays while the SDR base
-    provides fallback for SDR displays. This follows ISO 21496-1 standard.
+    Phase 4 (HDR Output):
+    - Convert ProPhoto RGB to Rec.2020
+    - Scale to absolute nits (SDR white = 203 nits per BT.2408)
+    - Apply PQ (SMPTE ST 2084) transfer function
+    - Encode as lossless JXL with Rec2100PQ color space
+
+    Output format:
+    - Color space: Rec.2020 (ITU-R BT.2020)
+    - Transfer function: PQ (SMPTE ST 2084)
+    - HDR standard: Rec.2100
+    - Peak luminance: 10,000 nits
 
     Raises:
         JxlExtractionError: If processing fails.
     """
     output_path = dest_dir / f"{info.path.stem}.jxl"
     temp_ppm = dest_dir / f".{info.path.stem}_temp.ppm"
-    temp_sdr_ppm = dest_dir / f".{info.path.stem}_sdr.ppm"
-    temp_gainmap_pgm = dest_dir / f".{info.path.stem}_gainmap.pgm"
-    temp_base_jxl = dest_dir / f".{info.path.stem}_base.jxl"
-    temp_gainmap_jxl = dest_dir / f".{info.path.stem}_gainmap.jxl"
+    temp_hdr_ppm = dest_dir / f".{info.path.stem}_hdr.ppm"
 
     # Use dcraw_emu_dng from build directory
     script_dir = Path(__file__).resolve().parent
@@ -1368,11 +1095,11 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
         dcraw_cmd = [
             str(dcraw_emu),
             "-W",        # Disable auto-brightness
-            "-g", "1", "1",  # Linear output (gamma applied in Python)
+            "-g", "1", "1",  # Linear output (PQ applied in Python)
             "-dngsdk",   # Use DNG SDK to decode JXL-compressed RAW
             "-6",        # 16-bit output
             "-q", "3",   # AHD demosaicing (high quality)
-            "-H", "0",   # Clip highlights (exposure applied in Python)
+            "-H", "0",   # Clip highlights at sensor max
             "-o", "4",   # Output color space: ProPhoto RGB (DNG SDK working space)
             "-Z", str(temp_ppm),
             str(info.path),
@@ -1392,169 +1119,101 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
         # Debug: Save raw dcraw output
         _save_debug_stage(temp_ppm, "01_dcraw", info.path.stem)
 
-        # === HDR Path: Compute scene-referred data WITHOUT clipping ===
-        # Capture true linear data before any processing that might clip
+        # Read linear RAW data
         dcraw_linear, width, height = _read_ppm_as_float(temp_ppm)
 
-        # Extract PGTM early so we can use it for both HDR and SDR paths
+        # Extract PGTM for local tone mapping
         pgtm = _extract_profile_gain_table_map(info.path)
 
-        # Compute HDR reference: PGTM first (with exposure in weight), then exposure
+        # Compute exposure multiplier (BaselineExposure + optional offset)
+        total_exposure_ev = baseline_exposure_ev + EXPOSURE_OFFSET
+        exposure_mult = 2.0 ** total_exposure_ev
+
+        # Phase 2: Apply ProfileGainTableMap (local tone mapping)
         # Per DNG SDK (dng_reference.cpp:3375-3404):
         # 1. Compute weight from RAW pixels
         # 2. Scale weight by 2^BaselineExposure
         # 3. Look up gain from table
         # 4. Apply gain to pixels
-        # 5. Then apply exposure multiplier
-        exposure_mult = 2.0 ** baseline_exposure_ev
-
         if pgtm:
-            # Compute PGTM gains from RAW pixels with exposure scaling in weight
             pgtm_gains = _compute_pgtm_gains(dcraw_linear, pgtm, baseline_exposure_ev)
-            hdr_linear = dcraw_linear * pgtm_gains[:, :, np.newaxis]  # No clipping!
+            hdr_linear = dcraw_linear * pgtm_gains[:, :, np.newaxis]
         else:
             hdr_linear = dcraw_linear.copy()
 
-        # Apply exposure AFTER PGTM (DNG SDK order)
-        hdr_linear = hdr_linear * exposure_mult  # No clipping!
-
-        # Convert HDR from ProPhoto to Rec.2020 (DNG SDK applies color matrix after processing)
-        hdr_linear = _convert_prophoto_to_rec2020(hdr_linear)
-
-        # === SDR Path: Apply processing with clipping for display ===
-        # DNG SDK order (dng_render.cpp): PGTM -> Exposure -> ToneCurve
-
-        # Phase 2: Apply ProfileGainTableMap FIRST (DNG SDK order)
-        # Weight is scaled by 2^BaselineExposure per dng_render.cpp:1887
-        if pgtm:
-            _apply_profile_gain_table_map(temp_ppm, pgtm, exposure_mult)
-
         # Debug: Save post-PGTM output
+        _write_ppm_from_float(temp_ppm, hdr_linear, width, height)
         _save_debug_stage(
             temp_ppm, "02_pgtm", info.path.stem,
             {"pgtm_applied": pgtm is not None, "weight_scale": exposure_mult}
         )
 
-        # Phase 3: Apply exposure ramp AFTER PGTM (DNG SDK order)
-        _apply_exposure_ramp(temp_ppm, baseline_exposure_ev)
+        # Phase 3: Apply exposure AFTER PGTM (DNG SDK order)
+        hdr_linear = hdr_linear * exposure_mult
 
         # Debug: Save post-exposure output
+        _write_ppm_from_float(temp_ppm, np.clip(hdr_linear, 0, 1), width, height)
         _save_debug_stage(
             temp_ppm, "03_exposure", info.path.stem,
             {"baseline_exposure_ev": baseline_exposure_ev, "multiplier": exposure_mult}
         )
 
-        # === GAIN MAP COMPUTATION (must be before tone curve) ===
-        # Read LINEAR SDR for gain map (both inputs must be linear per ISO 21496-1)
-        sdr_linear_prophoto, width, height = _read_ppm_as_float(temp_ppm)
+        # Phase 3.5: Apply ProfileToneCurve (global contrast)
+        # This S-curve adds characteristic contrast by darkening shadows
+        # HDR values > 1.0 are extended linearly to preserve headroom
+        tone_curve = _extract_profile_tone_curve(info.path)
+        if tone_curve:
+            curve_inputs, curve_outputs = tone_curve
+            hdr_linear = _apply_profile_tone_curve(hdr_linear, curve_inputs, curve_outputs)
 
-        # Convert SDR from ProPhoto to Rec.2020 (same color space as HDR for valid ratio)
-        sdr_linear_for_gainmap = _convert_prophoto_to_rec2020(sdr_linear_prophoto)
-
-        # Compute gain map from LINEAR SDR and LINEAR HDR
-        # The gain map captures the full dynamic range difference per ISO 21496-1
-        # Both inputs are now in linear Rec.2020 scene-referred space
-        gain_map, gain_metadata = compute_gain_map(sdr_linear_for_gainmap, hdr_linear)
-
-        # Debug: Save pre-tonecurve linear state
-        _save_debug_stage(
-            temp_ppm, "03b_linear_sdr", info.path.stem,
-            {"gain_min": gain_metadata["gain_map_min"], "gain_max": gain_metadata["gain_map_max"]}
-        )
-
-        # === DISPLAY ENCODING (after gain map) ===
-        # Apply ProfileToneCurve to create display-referred SDR
-        # This is the ONLY non-linear transform needed - it serves as the display encoding
-        curve_points = _extract_tone_curve(info.path)
-        if curve_points and len(curve_points) > 2:
-            lut = _build_tone_curve_lut(curve_points)
-            _apply_tone_curve_to_ppm(temp_ppm, lut)
-
-        # Debug: Save post-tonecurve output
-        _save_debug_stage(
-            temp_ppm, "04_tonecurve", info.path.stem,
-            {"tonecurve_applied": curve_points is not None and len(curve_points) > 2}
-        )
-
-        # Read tone-curved SDR (still in ProPhoto, aesthetically shaped)
-        sdr_tonemapped_prophoto, _, _ = _read_ppm_as_float(temp_ppm)
-
-        # Convert to Rec.2020 before display encoding (DNG SDK applies color matrix after processing)
-        sdr_tonemapped = _convert_prophoto_to_rec2020(sdr_tonemapped_prophoto)
-
-        # Apply sRGB gamma for display encoding
-        # ProfileToneCurve is a TONE CURVE (aesthetic shaping), not a transfer function
-        # We still need sRGB gamma for perceptual encoding to display
-        sdr_gamma = apply_srgb_gamma(sdr_tonemapped)
-        _write_ppm_from_float(temp_sdr_ppm, sdr_gamma, width, height)
-
-        # Debug: Save final sRGB-encoded output
-        if DEBUG_MODE and DEBUG_OUTPUT_DIR is not None:
+            # Debug: Save post-tone-curve output
+            _write_ppm_from_float(temp_ppm, np.clip(hdr_linear, 0, 1), width, height)
             _save_debug_stage(
-                temp_sdr_ppm, "05_srgb_gamma", info.path.stem,
-                {"note": "sRGB encoded - tone curve + gamma for display"}
+                temp_ppm, "04_tonecurve", info.path.stem,
+                {"curve_points": len(curve_inputs)}
             )
 
-        # Write gain map as PGM (8-bit grayscale)
-        _write_pgm_from_uint8(temp_gainmap_pgm, gain_map)
+        # Phase 4: Convert to Rec.2020 and apply PQ
+        # Convert from ProPhoto RGB to Rec.2020 (still linear)
+        hdr_rec2020 = _convert_prophoto_to_rec2020(hdr_linear)
+
+        # Scale to absolute nits (SDR white = 203 nits per ITU-R BT.2408)
+        hdr_nits = _scale_to_nits(hdr_rec2020, sdr_white_nits=203.0)
+
+        # Apply PQ transfer function (SMPTE ST 2084)
+        hdr_pq = _apply_pq_oetf(hdr_nits)
+
+        # Debug: Save PQ-encoded output
+        _write_ppm_from_float(temp_ppm, hdr_pq, width, height)
+        _save_debug_stage(
+            temp_ppm, "05_pq", info.path.stem,
+            {"transfer_function": "PQ", "sdr_white_nits": 203.0}
+        )
+
+        # Write final HDR PQ PPM
+        _write_ppm_from_float(temp_hdr_ppm, hdr_pq, width, height)
 
         # Get local cjxl path and environment
-        script_dir = Path(__file__).resolve().parent
         cjxl_path = script_dir / "build" / "deps" / "bin" / "cjxl"
         cjxl_env = os.environ.copy()
         cjxl_env["LD_LIBRARY_PATH"] = _get_library_path()
 
-        # Encode SDR base as JXL container (Rec.2020 primaries + sRGB transfer)
-        cjxl_base_cmd = [
+        # Encode as HDR JXL with Rec2100PQ color space
+        cjxl_cmd = [
             str(cjxl_path),
-            str(temp_sdr_ppm),
-            str(temp_base_jxl),
-            "-d", "0",       # Lossless compression
-            "-e", "7",       # Encoding effort
-            "-x", "color_space=RGB_D65_202_Rel_SRG",  # Rec.2020 + sRGB transfer
-            "--container=1",  # Force ISOBMFF container
+            str(temp_hdr_ppm),
+            str(output_path),
+            "-d", "0",                          # Lossless compression
+            "-e", "7",                          # Encoding effort
+            "-x", "color_space=Rec2100PQ",      # Rec.2020 + PQ transfer
+            "--intensity_target=10000",          # 10,000 nits peak
         ]
 
-        result = subprocess.run(cjxl_base_cmd, capture_output=True, text=True, env=cjxl_env)
+        result = subprocess.run(cjxl_cmd, capture_output=True, text=True, env=cjxl_env)
         if result.returncode != 0:
             raise JxlExtractionError(
-                f"cjxl base encoding failed: {result.stderr or result.stdout}"
+                f"cjxl encoding failed: {result.stderr or result.stdout}"
             )
-
-        # Encode gain map as naked JXL codestream
-        cjxl_gainmap_cmd = [
-            str(cjxl_path),
-            str(temp_gainmap_pgm),
-            str(temp_gainmap_jxl),
-            "-d", "0",       # Lossless for gain map too
-            "-e", "7",       # High effort
-            "--container=0",  # Naked codestream (no container)
-        ]
-
-        result = subprocess.run(cjxl_gainmap_cmd, capture_output=True, text=True, env=cjxl_env)
-        if result.returncode != 0:
-            raise JxlExtractionError(
-                f"cjxl gain map encoding failed: {result.stderr or result.stdout}"
-            )
-
-        # Read encoded files
-        with open(temp_base_jxl, "rb") as f:
-            base_jxl_data = f.read()
-        with open(temp_gainmap_jxl, "rb") as f:
-            gainmap_codestream = f.read()
-
-        # Serialize ISO 21496-1 metadata
-        iso_metadata = serialize_iso21496_metadata(**gain_metadata)
-
-        # Serialize jhgm bundle
-        jhgm_bundle = serialize_jhgm_bundle(iso_metadata, gainmap_codestream)
-
-        # Insert jhgm box into container
-        final_jxl = insert_jhgm_box(base_jxl_data, jhgm_bundle)
-
-        # Write final output
-        with open(output_path, "wb") as f:
-            f.write(final_jxl)
 
     except JxlExtractionError:
         raise
@@ -1563,9 +1222,8 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             output_path.unlink()
         raise JxlExtractionError(f"Failed to process {info.path.name}: {e}")
     finally:
-        # Clean up all temp files
-        for temp_file in [temp_ppm, temp_sdr_ppm, temp_gainmap_pgm,
-                          temp_base_jxl, temp_gainmap_jxl]:
+        # Clean up temp files
+        for temp_file in [temp_ppm, temp_hdr_ppm]:
             if temp_file.exists():
                 temp_file.unlink()
 
@@ -1668,13 +1326,14 @@ def process_all(
 
 def main() -> None:
     """Script entry point."""
-    global DEBUG_MODE, DEBUG_OUTPUT_DIR, PGTM_STRENGTH
+    global DEBUG_MODE, DEBUG_OUTPUT_DIR, PGTM_STRENGTH, EXPOSURE_OFFSET
 
     args = parse_arguments()
 
     # Set global flags
     DEBUG_MODE = args.debug
     PGTM_STRENGTH = args.pgtm_strength
+    EXPOSURE_OFFSET = args.exposure_offset
     if DEBUG_MODE:
         DEBUG_OUTPUT_DIR = args.debug_dir or (args.dest / "debug")
         DEBUG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
