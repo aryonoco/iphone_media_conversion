@@ -573,6 +573,3 @@ docker-compose.override.yaml
 ##################################
 # Project-specific               #
 ##################################
-
-# DNG SDK downloads (large, versioned folders)
-dng_sdk_*/

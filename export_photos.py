@@ -227,7 +227,7 @@ def validate_environment() -> None:
 
     # Check dcraw_emu_dng (for iPhone ProRAW DNG processing)
     script_dir = Path(__file__).resolve().parent
-    dcraw_emu = script_dir / "dcraw_emu_dng"
+    dcraw_emu = script_dir / "build" / "dcraw_emu_dng"
     if not dcraw_emu.exists():
         raise ValidationError(
             f"dcraw_emu_dng not found at {dcraw_emu}. Run libraw_dng.py to build it."
@@ -299,31 +299,21 @@ def _detect_homebrew_prefix() -> Path | None:
 def _get_dcraw_library_path() -> str:
     """Build LD_LIBRARY_PATH for dcraw_emu_dng runtime libraries.
 
-    The dcraw_emu_dng binary requires several shared libraries at runtime:
-    - libraw.so.24: LibRaw library (usually ~/.local/lib)
-    - libjpeg.so.8: JPEG library (from Homebrew)
-    - libc++.so, libomp.so: LLVM runtime (from Homebrew LLVM)
-    - libjxl.so, brotli libs: JPEG XL support (from build deps)
+    All libraries are in ./build/lib (libraw, libjxl, etc.).
+    Homebrew LLVM libraries (libc++, libomp) are still needed for clang runtime.
 
     Returns:
         Colon-separated library path string.
     """
     paths: list[str] = []
 
-    # LibRaw installed location
-    libraw_lib = Path.home() / ".local" / "lib"
-    if libraw_lib.exists():
-        paths.append(str(libraw_lib))
+    # All libraries from build directory
+    script_dir = Path(__file__).resolve().parent
+    build_lib = script_dir / "build" / "lib"
+    if build_lib.exists():
+        paths.append(str(build_lib))
 
-    # libjxl and dependencies from build
-    deps_lib = Path.home() / "libraw-dng-build" / "deps" / "lib"
-    deps_lib64 = Path.home() / "libraw-dng-build" / "deps" / "lib64"
-    if deps_lib.exists():
-        paths.append(str(deps_lib))
-    if deps_lib64.exists():
-        paths.append(str(deps_lib64))
-
-    # Homebrew LLVM (libc++, libomp) and libraries (libjpeg)
+    # Homebrew LLVM (libc++, libomp) - needed for clang runtime
     brew_prefix = _detect_homebrew_prefix()
     if brew_prefix:
         llvm_lib = brew_prefix / "opt" / "llvm" / "lib"
@@ -1023,9 +1013,9 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
     output_path = dest_dir / f"{info.path.stem}.jxl"
     temp_ppm = dest_dir / f".{info.path.stem}_temp.ppm"
 
-    # Use dcraw_emu_dng from script directory
+    # Use dcraw_emu_dng from build directory
     script_dir = Path(__file__).resolve().parent
-    dcraw_emu = script_dir / "dcraw_emu_dng"
+    dcraw_emu = script_dir / "build" / "dcraw_emu_dng"
 
     # Get baseline exposure for PGTM weight scaling and exposure ramp
     baseline_exposure_ev = _get_baseline_exposure_ev(info.path)

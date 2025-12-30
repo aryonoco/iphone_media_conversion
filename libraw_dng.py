@@ -16,9 +16,7 @@ Build LibRaw with Adobe DNG SDK support for iPhone 16/17 Pro JPEG-XL DNG files.
 
 Works on Fedora, Debian/Ubuntu, Arch, and systems with Homebrew (Linux or macOS).
 
-PREREQUISITE:
-  Download the Adobe DNG SDK from: https://www.adobe.com/go/dng_sdk
-  Save the zip file in the same directory as this script.
+The Adobe DNG SDK is downloaded automatically from Adobe's servers.
 
 Adobe DNG SDK: https://helpx.adobe.com/camera-raw/digital-negative.html
 LibRaw: https://www.libraw.org/
@@ -54,11 +52,8 @@ __all__: Final[list[str]] = [
 
 __version__: Final[str] = "1.1.0"
 
-# Adobe DNG SDK download page (requires browser - cannot be automated)
+# Adobe DNG SDK download URL (redirects to actual zip file)
 _DNG_SDK_DOWNLOAD_URL: Final[str] = "https://www.adobe.com/go/dng_sdk"
-
-# Pattern to match DNG SDK zip files (e.g., dng_sdk_1_7_1_2410_20251117.zip)
-_DNG_SDK_ZIP_PATTERN: Final[str] = "dng_sdk*.zip"
 
 # Type aliases (PEP 695)
 type CommandResult = subprocess.CompletedProcess[str]
@@ -171,12 +166,12 @@ class BuildConfig:
             build_dir=(
                 build_dir
                 or _get_env_path("BUILD_DIR")
-                or Path.home() / "libraw-dng-build"
+                or _get_script_dir() / "build"
             ),
             install_prefix=(
                 install_prefix
                 or _get_env_path("INSTALL_PREFIX")
-                or Path.home() / ".local"
+                or _get_script_dir() / "build"
             ),
             jobs=jobs or _get_env_int("JOBS") or _get_cpu_count(),
             skip_deps=skip_deps or os.environ.get("SKIP_DEPS") == "1",
@@ -454,37 +449,66 @@ class Builder:
         ]
         self.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", *packages])
 
-    def _find_dng_sdk_zip(self) -> Path:
-        """Find the DNG SDK zip file in the script directory."""
-        script_dir = _get_script_dir()
+    def _download_dng_sdk(self) -> Path:
+        """Download DNG SDK from Adobe, following redirect to get actual file.
 
-        # Look for dng_sdk*.zip files
-        pattern = str(script_dir / _DNG_SDK_ZIP_PATTERN)
-        matches = sorted(glob.glob(pattern))
+        Downloads to build directory. Skips download if file already exists.
+        Uses curl for reliable HTTP/2 and redirect handling.
+        """
+        self._logger.info("Setting up Adobe DNG SDK...")
 
-        if not matches:
-            c = _AnsiColor
+        self.config.build_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # First, get the final URL after redirect using curl
+            result = subprocess.run(
+                ["curl", "-sI", "-L", "-o", "/dev/null", "-w", "%{url_effective}",
+                 _DNG_SDK_DOWNLOAD_URL],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+            final_url = result.stdout.strip()
+            filename = Path(final_url).name
+
+            if not filename.endswith(".zip"):
+                raise BuildError(f"Unexpected file type from Adobe: {filename}")
+
+            dest_path = self.config.build_dir / filename
+
+            # Skip if already downloaded
+            if dest_path.exists():
+                self._logger.info("Using cached DNG SDK: %s", filename)
+                return dest_path
+
+            self._logger.info("Downloading %s...", filename)
+
+            # Download with curl (handles HTTP/2, shows progress)
+            result = subprocess.run(
+                ["curl", "-L", "-o", str(dest_path), "--progress-bar",
+                 _DNG_SDK_DOWNLOAD_URL],
+                timeout=600,  # 10 min for ~80MB
+                check=True,
+            )
+
+            self._logger.info("Downloaded: %s", dest_path.name)
+            return dest_path
+
+        except subprocess.CalledProcessError as exc:
             raise BuildError(
-                f"Adobe DNG SDK not found!\n\n"
-                f"{c.BOLD}Please download the DNG SDK manually:{c.RESET}\n"
-                f"  1. Visit: {c.YELLOW}{_DNG_SDK_DOWNLOAD_URL}{c.RESET}\n"
-                f"  2. Save the zip file to: {c.YELLOW}{script_dir}{c.RESET}\n"
-                f"  3. Run this script again\n\n"
-                f"Expected filename pattern: {_DNG_SDK_ZIP_PATTERN}\n"
-                f"Example: dng_sdk_1_7_1_2410_20251117.zip"
+                f"Failed to download DNG SDK from Adobe (curl error)\n"
+                f"URL: {_DNG_SDK_DOWNLOAD_URL}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise BuildError(
+                f"Download timed out after 10 minutes\n"
+                f"URL: {_DNG_SDK_DOWNLOAD_URL}"
+            ) from exc
+        except FileNotFoundError:
+            raise BuildError(
+                "curl not found. Please install curl to download the DNG SDK."
             )
-
-        if len(matches) > 1:
-            self._logger.warning(
-                "Multiple DNG SDK zips found, using newest: %s",
-                [Path(m).name for m in matches],
-            )
-
-        # Use the last one (sorted alphabetically, so newest version usually last)
-        zip_path = Path(matches[-1])
-        self._logger.info("Found DNG SDK: %s", zip_path.name)
-
-        return zip_path
 
     def _extract_dng_sdk_info(self, zip_path: Path) -> str:
         """Extract version info from DNG SDK zip filename."""
@@ -513,9 +537,9 @@ class Builder:
         return name
 
     def _setup_dng_sdk(self) -> None:
-        """Find, extract, and set up the DNG SDK."""
-        # Find the zip file
-        self._dng_sdk_zip = self._find_dng_sdk_zip()
+        """Download and extract the DNG SDK."""
+        # Download (or use cached)
+        self._dng_sdk_zip = self._download_dng_sdk()
         self._dng_sdk_info = self._extract_dng_sdk_info(self._dng_sdk_zip)
 
         self._logger.info("DNG SDK version: %s", self._dng_sdk_info)
@@ -1042,14 +1066,12 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
     ) -> None:
         """Build dcraw_emu binary with DNG SDK support.
 
-        The binary is placed in the same directory as this script,
-        so export_media.py can find it without PATH modifications.
+        The binary is placed in the build directory (install_prefix).
         """
         self._logger.info("Building dcraw_emu with DNG SDK support...")
 
-        # Output to script directory (same as libraw_dng.py and export_media.py)
-        script_dir = _get_script_dir()
-        output_binary = script_dir / "dcraw_emu_dng"
+        # Output to build directory
+        output_binary = self.config.install_prefix / "dcraw_emu_dng"
 
         # Get compiler from build environment (clang for Homebrew, g++ for system)
         build_env = self._build_env()
@@ -1103,8 +1125,7 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
 
     def verify(self) -> None:
         """Verify the build succeeded."""
-        script_dir = _get_script_dir()
-        binary = script_dir / "dcraw_emu_dng"
+        binary = self.config.install_prefix / "dcraw_emu_dng"
 
         if not binary.exists():
             raise BuildError(f"Build failed - binary not found at {binary}")
@@ -1127,8 +1148,8 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
 {c.BOLD}Usage for iPhone 16/17 Pro DNG files:{c.RESET}
   {binary} -dngsdk -T -Z output.tiff input.DNG
 
-{c.GRAY}The binary is in the same directory as this script.
-Use export_media.py to process iPhone ProRAW files.{c.RESET}
+{c.GRAY}All build artifacts are in: {self.config.build_dir}
+Use export_photos.py to process iPhone ProRAW files.{c.RESET}
 """)
 
     def build_all(self) -> None:
@@ -1177,13 +1198,13 @@ def _parse_args() -> argparse.Namespace:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-PREREQUISITE:
-  Download the Adobe DNG SDK from: {_DNG_SDK_DOWNLOAD_URL}
-  Save the zip file in the same directory as this script.
+The Adobe DNG SDK is downloaded automatically from Adobe's servers.
+
+All build artifacts are placed in ./build/ by default.
 
 Environment variables:
-  BUILD_DIR        Build directory (default: ~/libraw-dng-build)
-  INSTALL_PREFIX   Installation prefix (default: ~/.local)
+  BUILD_DIR        Build directory (default: ./build)
+  INSTALL_PREFIX   Installation prefix (default: ./build)
   JOBS             Parallel build jobs (default: {default_jobs})
   SKIP_DEPS        Set to "1" to skip dependency installation
 
@@ -1205,14 +1226,14 @@ Examples:
         type=Path,
         default=None,
         metavar="DIR",
-        help="Build directory (default: ~/libraw-dng-build)",
+        help="Build directory (default: ./build)",
     )
     parser.add_argument(
         "--install-prefix",
         type=Path,
         default=None,
         metavar="DIR",
-        help="Installation prefix (default: ~/.local)",
+        help="Installation prefix (default: ./build)",
     )
     parser.add_argument(
         "-j", "--jobs",
