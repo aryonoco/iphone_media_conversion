@@ -55,7 +55,6 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 
 from jxl_gainmap import (
-    tone_map_hdr_to_sdr_linear,
     apply_srgb_gamma,
     compute_gain_map,
     serialize_iso21496_metadata,
@@ -1053,17 +1052,17 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
     Phase 3 (Exposure):
     - Apply BaselineExposure correction after PGTM (DNG SDK order)
 
-    Phase 4 (Tone Curve):
-    - Apply ProfileToneCurve from DNG metadata for global tonal rendering
-    - Save result as HDR reference (linear Rec.2020)
-
-    Phase 5 (HDR Pipeline):
-    - Tone map HDR -> SDR (linear Rec.2020)
-    - Compute gain map from SDR/HDR luminance ratios
+    Phase 4 (HDR Pipeline):
+    - Save post-exposure linear data as TRUE HDR reference (scene-referred)
+    - Apply ProfileToneCurve from DNG for SDR rendering (Apple's look)
+    - Compute gain map from HDR/SDR luminance ratios
     - Apply sRGB gamma to SDR for display encoding
-    - Encode SDR base as JXL container
-    - Encode gain map as naked JXL codestream
+    - Encode SDR base as lossless JXL container (Rec.2020 + sRGB transfer)
+    - Encode gain map as lossless naked JXL codestream
     - Insert jhgm box via container surgery
+
+    The gain map enables HDR reconstruction on HDR displays while the SDR base
+    provides fallback for SDR displays. This follows ISO 21496-1 standard.
 
     Raises:
         JxlExtractionError: If processing fails.
@@ -1122,18 +1121,20 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
         # Phase 3: Apply exposure ramp after PGTM (DNG SDK pipeline order)
         _apply_exposure_ramp(temp_ppm, baseline_exposure_ev)
 
-        # Phase 4: Apply ProfileToneCurve from DNG for global tonal rendering
+        # Phase 4: HDR Pipeline - Generate gain map and encode with container surgery
+        # Read the post-exposure result as TRUE HDR reference (linear Rec.2020)
+        # This is BEFORE the tone curve - scene-referred linear data
+        hdr_linear, width, height = _read_ppm_as_float(temp_ppm)
+
+        # Apply ProfileToneCurve to get SDR (Apple's rendering)
+        # This creates the display-referred SDR version
         curve_points = _extract_tone_curve(info.path)
         if curve_points and len(curve_points) > 2:
             lut = _build_tone_curve_lut(curve_points)
             _apply_tone_curve_to_ppm(temp_ppm, lut)
 
-        # Phase 5: HDR Pipeline - Generate gain map and encode with container surgery
-        # Read the post-tone-curve result as HDR reference (linear Rec.2020)
-        hdr_linear, width, height = _read_ppm_as_float(temp_ppm)
-
-        # Tone map HDR to SDR (stays linear for gain map computation)
-        sdr_linear = tone_map_hdr_to_sdr_linear(hdr_linear)
+        # Read the tone-curved result as SDR (still linear, pre-gamma)
+        sdr_linear, _, _ = _read_ppm_as_float(temp_ppm)
 
         # Compute gain map from linear SDR and HDR
         gain_map, gain_metadata = compute_gain_map(sdr_linear, hdr_linear)
@@ -1150,7 +1151,7 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             "cjxl",
             str(temp_sdr_ppm),
             str(temp_base_jxl),
-            "-d", "0.5",     # Slight lossy for smaller files (visually lossless)
+            "-d", "0",       # Lossless compression
             "-e", "7",       # Encoding effort
             "-x", "color_space=RGB_D65_202_Rel_SRG",  # Rec.2020 + sRGB transfer
             "--container=1",  # Force ISOBMFF container
@@ -1167,8 +1168,8 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             "cjxl",
             str(temp_gainmap_pgm),
             str(temp_gainmap_jxl),
-            "-d", "1.0",     # Slight lossy OK for gain map
-            "-e", "5",       # Lower effort for gain map
+            "-d", "0",       # Lossless for gain map too
+            "-e", "7",       # High effort
             "--container=0",  # Naked codestream (no container)
         ]
 
