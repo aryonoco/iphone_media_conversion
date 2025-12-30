@@ -41,6 +41,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -100,6 +101,65 @@ COPY_ONLY_EXTENSIONS: Final[frozenset[str]] = frozenset(
 
 # Rich console for output
 console = Console()
+
+# Global flags (set by argument parser)
+DEBUG_MODE: bool = False
+DEBUG_OUTPUT_DIR: Path | None = None
+PGTM_STRENGTH: float = 0.5  # Default: match Apple Photos rendering
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Convert iPhone ProRAW DNG files to JPEG XL with HDR gain maps.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                          # Use default source/dest directories
+  %(prog)s --source ~/Photos/raw    # Custom source directory
+  %(prog)s --debug                  # Output intermediate PPM files for debugging
+  %(prog)s --debug --debug-dir /tmp/debug  # Custom debug output directory
+""",
+    )
+    parser.add_argument(
+        "--source", "-s",
+        type=Path,
+        default=Path(SOURCE_DIR),
+        help=f"Source directory containing DNG files (default: {SOURCE_DIR})",
+    )
+    parser.add_argument(
+        "--dest", "-d",
+        type=Path,
+        default=Path(DESTINATION_DIR),
+        help=f"Destination directory for JXL output (default: {DESTINATION_DIR})",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode: output intermediate PPM files at each pipeline stage",
+    )
+    parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=None,
+        help="Directory for debug output (default: <dest>/debug/)",
+    )
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Force reprocessing of files that already have output",
+    )
+    parser.add_argument(
+        "--pgtm-strength",
+        type=float,
+        default=0.5,
+        help=(
+            "ProfileGainTableMap strength (0.0-1.0). Controls how strongly PGTM "
+            "local tone mapping is applied. 1.0 = full DNG spec, 0.5 = matches "
+            "Apple Photos rendering (default: 0.5)"
+        ),
+    )
+    return parser.parse_args()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -218,17 +278,23 @@ def validate_environment() -> None:
     except subprocess.CalledProcessError:
         raise ValidationError("exiftool failed to run")
 
-    # Check cjxl (for JPEG XL encoding with color space support)
+    # Check cjxl (local build required)
+    script_dir = Path(__file__).resolve().parent
+    cjxl_path = script_dir / "build" / "deps" / "bin" / "cjxl"
+    if not cjxl_path.exists():
+        raise ValidationError(
+            f"Local cjxl not found at {cjxl_path}. Run libraw_dng.py to build dependencies."
+        )
+    # Verify it runs with proper library path
     try:
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = _get_library_path()
         subprocess.run(
-            ["cjxl", "--version"],
+            [str(cjxl_path), "--version"],
             capture_output=True,
             text=True,
             check=True,
-        )
-    except FileNotFoundError:
-        raise ValidationError(
-            "cjxl not found in PATH. Install libjxl: https://github.com/libjxl/libjxl"
+            env=env,
         )
     except subprocess.CalledProcessError:
         raise ValidationError("cjxl failed to run")
@@ -244,7 +310,7 @@ def validate_environment() -> None:
     # Test that dcraw_emu_dng can actually run with required libraries
     try:
         env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = _get_dcraw_library_path()
+        env["LD_LIBRARY_PATH"] = _get_library_path()
         result = subprocess.run(
             [str(dcraw_emu)],
             capture_output=True,
@@ -304,22 +370,29 @@ def _detect_homebrew_prefix() -> Path | None:
     return None
 
 
-def _get_dcraw_library_path() -> str:
-    """Build LD_LIBRARY_PATH for dcraw_emu_dng runtime libraries.
+def _get_library_path() -> str:
+    """Build LD_LIBRARY_PATH for local binaries (dcraw_emu_dng, cjxl).
 
-    All libraries are in ./build/lib (libraw, libjxl, etc.).
-    Homebrew LLVM libraries (libc++, libomp) are still needed for clang runtime.
+    Libraries:
+    - ./build/lib: libraw
+    - ./build/deps/lib64: libjxl, libbrotli, etc.
+    - Homebrew LLVM: libc++, libomp (clang runtime)
 
     Returns:
         Colon-separated library path string.
     """
     paths: list[str] = []
-
-    # All libraries from build directory
     script_dir = Path(__file__).resolve().parent
+
+    # LibRaw libraries
     build_lib = script_dir / "build" / "lib"
     if build_lib.exists():
         paths.append(str(build_lib))
+
+    # libjxl and dependencies
+    deps_lib64 = script_dir / "build" / "deps" / "lib64"
+    if deps_lib64.exists():
+        paths.append(str(deps_lib64))
 
     # Homebrew LLVM (libc++, libomp) - needed for clang runtime
     brew_prefix = _detect_homebrew_prefix()
@@ -599,10 +672,17 @@ def _apply_profile_gain_table_map(
     # Interpolate gains
     gains = interp(coords).reshape(height, width)
 
-    # Apply gain to all channels
-    img[:, :, 0] *= gains
-    img[:, :, 1] *= gains
-    img[:, :, 2] *= gains
+    # Scale gains by PGTM_STRENGTH (0.5 matches Apple Photos rendering)
+    # scaled_gain = 1.0 + (gain - 1.0) * strength
+    # At strength=1.0: full DNG spec gains
+    # At strength=0.5: halfway between gain and 1.0 (matches Apple)
+    # At strength=0.0: all gains become 1.0 (no PGTM effect)
+    scaled_gains = 1.0 + (gains - 1.0) * PGTM_STRENGTH
+
+    # Apply scaled gain to all channels
+    img[:, :, 0] *= scaled_gains
+    img[:, :, 1] *= scaled_gains
+    img[:, :, 2] *= scaled_gains
 
     # Clamp and convert back to big-endian 16-bit
     img = np.clip(img, 0, 65535).astype(">u2")
@@ -613,6 +693,84 @@ def _apply_profile_gain_table_map(
         f.write(f"{width} {height}\n".encode())
         f.write(f"{maxval}\n".encode())
         f.write(img.tobytes())
+
+
+def _compute_pgtm_gains(
+    img: np.ndarray,
+    pgtm: dict[str, Any],
+) -> np.ndarray:
+    """Compute PGTM gains for a numpy array without applying or clipping.
+
+    This function extracts the gain computation from _apply_profile_gain_table_map
+    for use in HDR pipelines where we need gains without clipping.
+
+    Args:
+        img: Float32 array shape (H, W, 3), normalized 0-1 range (or higher for HDR).
+        pgtm: Dictionary from _extract_profile_gain_table_map().
+
+    Returns:
+        2D float32 array of scaled gains, shape (H, W).
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    height, width = img.shape[:2]
+
+    # Extract PGTM parameters
+    points_v = pgtm["points_v"]
+    points_h = pgtm["points_h"]
+    num_table_points = pgtm["num_table_points"]
+    spacing_v = pgtm["spacing_v"]
+    spacing_h = pgtm["spacing_h"]
+    origin_v = pgtm["origin_v"]
+    origin_h = pgtm["origin_h"]
+    input_weights = np.array(pgtm["input_weights"])
+    table = pgtm["table"]
+
+    # Calculate weight per pixel (clamp to 0-1 for table lookup)
+    r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    rgb_min = np.minimum(np.minimum(r, g), b)
+    rgb_max = np.maximum(np.maximum(r, g), b)
+
+    weight = (
+        input_weights[0] * r
+        + input_weights[1] * g
+        + input_weights[2] * b
+        + input_weights[3] * rgb_min
+        + input_weights[4] * rgb_max
+    )
+    # Clamp weight to valid table range (but don't clamp the pixel values)
+    weight = np.clip(weight, 0.0, 1.0)
+
+    # Map weight to table index
+    weight_idx = weight * (num_table_points - 1)
+    weight_idx = np.clip(weight_idx, 0, num_table_points - 1)
+
+    # Compute spatial coordinates
+    rows = np.arange(height, dtype=np.float32) + 0.5
+    cols = np.arange(width, dtype=np.float32) + 0.5
+    v_image = rows / height
+    u_image = cols / width
+    row_coords = np.clip((v_image - origin_v) / spacing_v, 0, points_v - 1)
+    col_coords = np.clip((u_image - origin_h) / spacing_h, 0, points_h - 1)
+    row_grid, col_grid = np.meshgrid(row_coords, col_coords, indexing="ij")
+
+    # Build interpolator
+    v_axis = np.arange(points_v)
+    h_axis = np.arange(points_h)
+    n_axis = np.arange(num_table_points)
+    interp = RegularGridInterpolator(
+        (v_axis, h_axis, n_axis), table, method="linear",
+        bounds_error=False, fill_value=1.0,
+    )
+
+    # Interpolate gains
+    coords = np.stack([row_grid.ravel(), col_grid.ravel(), weight_idx.ravel()], axis=1)
+    gains = interp(coords).reshape(height, width)
+
+    # Scale by PGTM_STRENGTH
+    scaled_gains = 1.0 + (gains - 1.0) * PGTM_STRENGTH
+
+    return scaled_gains
 
 
 def _build_tone_curve_lut(
@@ -853,10 +1011,11 @@ def _apply_display_gamma(ppm_path: Path) -> None:
 
 
 def _apply_exposure_ramp(ppm_path: Path, exposure_ev: float) -> None:
-    """Apply exposure ramp after PGTM (DNG SDK approach).
+    """Apply BaselineExposure as a linear multiplier with clipping.
 
-    The DNG SDK applies exposure AFTER ProfileGainTableMap, not before.
-    This function mimics dng_function_exposure_ramp from dng_render.cpp.
+    This function applies exposure BEFORE PGTM in this pipeline. While the
+    DNG SDK applies exposure after PGTM, the two approaches are mathematically
+    equivalent when PGTM weight scaling compensates for the order difference.
 
     The exposure ramp is: output = clamp(input * 2^exposure, 0, 1)
 
@@ -865,10 +1024,8 @@ def _apply_exposure_ramp(ppm_path: Path, exposure_ev: float) -> None:
     - Pixels at white_point map to 1.0 (new white)
     - Pixels above white_point clip to 1.0
 
-    Example: BaselineExposure = 1.94 EV
-    - exposure_mult = 2^1.94 = 3.84
-    - white_point = 1.0 / 3.84 = 0.26
-    - Input 0.26 -> Output 1.0
+    Note: For HDR pipelines, capture scene-referred data BEFORE calling this
+    function, as clipping destroys highlight headroom needed for gain maps.
 
     Args:
         ppm_path: Path to 16-bit linear PPM file (modified in place).
@@ -968,8 +1125,15 @@ def probe_image(path: Path) -> ImageInfo:
         raise ExiftoolError(f"Failed to parse exiftool output for {path}: {e}")
 
 
-def should_process_image(info: ImageInfo, dest_dir: Path) -> tuple[bool, str]:
+def should_process_image(
+    info: ImageInfo, dest_dir: Path, force: bool = False
+) -> tuple[bool, str]:
     """Determine if image should be processed.
+
+    Args:
+        info: Image information from probe_image()
+        dest_dir: Destination directory
+        force: If True, reprocess even if output exists
 
     Returns:
         Tuple of (should_process, reason_if_skipped)
@@ -979,7 +1143,7 @@ def should_process_image(info: ImageInfo, dest_dir: Path) -> tuple[bool, str]:
     else:
         output_path = dest_dir / info.path.name
 
-    if output_path.exists():
+    if output_path.exists() and not force:
         return False, "Output exists"
 
     return True, ""
@@ -1034,6 +1198,74 @@ def _write_pgm_from_uint8(pgm_path: Path, img: np.ndarray) -> None:
         f.write(img.tobytes())
 
 
+def _save_debug_stage(
+    ppm_path: Path,
+    stage_name: str,
+    image_stem: str,
+    metadata: dict | None = None,
+) -> None:
+    """Save intermediate PPM and statistics for debugging.
+
+    Copies the PPM file to the debug directory and computes luminance statistics.
+    Also writes a JSON file with metadata and statistics for each stage.
+
+    Args:
+        ppm_path: Path to the current PPM file
+        stage_name: Name of the pipeline stage (e.g., "01_dcraw", "02_exposure")
+        image_stem: Image filename stem for output naming
+        metadata: Optional additional metadata to include
+    """
+    if not DEBUG_MODE or DEBUG_OUTPUT_DIR is None:
+        return
+
+    # Read PPM data for statistics
+    try:
+        img, width, height = _read_ppm_as_float(ppm_path)
+    except Exception as e:
+        console.print(f"[red]Debug: Failed to read PPM for {stage_name}: {e}[/]")
+        return
+
+    # Compute luminance using Rec.2020 coefficients
+    lum = 0.2627 * img[:, :, 0] + 0.6780 * img[:, :, 1] + 0.0593 * img[:, :, 2]
+
+    stats = {
+        "stage": stage_name,
+        "image": image_stem,
+        "dimensions": f"{width}x{height}",
+        "min": float(img.min()),
+        "max": float(img.max()),
+        "mean": float(img.mean()),
+        "luminance": {
+            "min": float(lum.min()),
+            "max": float(lum.max()),
+            "mean": float(lum.mean()),
+            "percentiles": {
+                "1": float(np.percentile(lum, 1)),
+                "5": float(np.percentile(lum, 5)),
+                "25": float(np.percentile(lum, 25)),
+                "50": float(np.percentile(lum, 50)),
+                "75": float(np.percentile(lum, 75)),
+                "95": float(np.percentile(lum, 95)),
+                "99": float(np.percentile(lum, 99)),
+            },
+        },
+    }
+
+    if metadata:
+        stats["metadata"] = metadata
+
+    # Copy PPM to debug directory
+    debug_ppm = DEBUG_OUTPUT_DIR / f"{image_stem}_{stage_name}.ppm"
+    shutil.copy(ppm_path, debug_ppm)
+
+    # Write statistics JSON
+    debug_json = DEBUG_OUTPUT_DIR / f"{image_stem}_{stage_name}.json"
+    with open(debug_json, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    console.print(f"[dim]Debug: {stage_name} saved (1st%={stats['luminance']['percentiles']['1']:.6f})[/]")
+
+
 def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
     """Process iPhone ProRAW DNG to JXL with HDR support and ISO 21496-1 gain map.
 
@@ -1084,7 +1316,7 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
     try:
         # Build environment with library path for dcraw_emu_dng
         env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = _get_dcraw_library_path()
+        env["LD_LIBRARY_PATH"] = _get_library_path()
 
         # Phase 1: Process RAW to 16-bit linear PPM using dcraw_emu_dng
         dcraw_cmd = [
@@ -1111,20 +1343,45 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
                 f"dcraw_emu_dng did not produce output file for {info.path.name}"
             )
 
-        # Phase 2: Apply ProfileGainTableMap for local tone mapping
-        # PGTM weight is scaled by exposure to compensate for applying PGTM before exposure
-        pgtm = _extract_profile_gain_table_map(info.path)
-        pgtm_exp_mult = 2.0 ** baseline_exposure_ev
-        if pgtm:
-            _apply_profile_gain_table_map(temp_ppm, pgtm, pgtm_exp_mult)
+        # Debug: Save raw dcraw output
+        _save_debug_stage(temp_ppm, "01_dcraw", info.path.stem)
 
-        # Phase 3: Apply exposure ramp after PGTM (DNG SDK pipeline order)
+        # === HDR Path: Compute scene-referred data WITHOUT clipping ===
+        # Capture true linear data before any processing that might clip
+        dcraw_linear, width, height = _read_ppm_as_float(temp_ppm)
+
+        # Extract PGTM early so we can use it for both HDR and SDR paths
+        pgtm = _extract_profile_gain_table_map(info.path)
+
+        # Compute HDR reference: exposure + PGTM without clipping
+        # This preserves highlight detail that would be lost in the SDR path
+        exposure_mult = 2.0 ** baseline_exposure_ev
+        hdr_linear = dcraw_linear * exposure_mult  # No clipping!
+
+        if pgtm:
+            # Apply PGTM gains without clipping
+            pgtm_gains = _compute_pgtm_gains(hdr_linear, pgtm)
+            hdr_linear = hdr_linear * pgtm_gains[:, :, np.newaxis]  # No clipping!
+
+        # === SDR Path: Apply processing with clipping for display ===
+        # Phase 2: Apply exposure ramp (clips to [0, 1] for SDR display)
         _apply_exposure_ramp(temp_ppm, baseline_exposure_ev)
 
-        # Phase 4: HDR Pipeline - Generate gain map and encode with container surgery
-        # Read the post-exposure result as TRUE HDR reference (linear Rec.2020)
-        # This is BEFORE the tone curve - scene-referred linear data
-        hdr_linear, width, height = _read_ppm_as_float(temp_ppm)
+        # Debug: Save post-exposure output
+        _save_debug_stage(
+            temp_ppm, "02_exposure", info.path.stem,
+            {"baseline_exposure_ev": baseline_exposure_ev, "multiplier": exposure_mult}
+        )
+
+        # Phase 3: Apply ProfileGainTableMap (clips for SDR display)
+        if pgtm:
+            _apply_profile_gain_table_map(temp_ppm, pgtm, 1.0)
+
+        # Debug: Save post-PGTM output
+        _save_debug_stage(
+            temp_ppm, "03_pgtm", info.path.stem,
+            {"pgtm_applied": pgtm is not None}
+        )
 
         # Apply ProfileToneCurve to get SDR (Apple's rendering)
         # This creates the display-referred SDR version
@@ -1133,22 +1390,44 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             lut = _build_tone_curve_lut(curve_points)
             _apply_tone_curve_to_ppm(temp_ppm, lut)
 
-        # Read the tone-curved result as SDR (still linear, pre-gamma)
-        sdr_linear, _, _ = _read_ppm_as_float(temp_ppm)
+        # Debug: Save post-tonecurve output
+        _save_debug_stage(
+            temp_ppm, "04_tonecurve", info.path.stem,
+            {"tonecurve_applied": curve_points is not None and len(curve_points) > 2}
+        )
 
-        # Compute gain map from linear SDR and HDR
-        gain_map, gain_metadata = compute_gain_map(sdr_linear, hdr_linear)
+        # Read the tone-curved result (no longer linear - tone curve is non-linear)
+        sdr_tonemapped, _, _ = _read_ppm_as_float(temp_ppm)
+
+        # Compute gain map from true HDR (scene-referred, may exceed 1.0) and SDR
+        # The gain map captures the full dynamic range difference per ISO 21496-1
+        # hdr_linear: exposure + PGTM applied without clipping (true scene-referred)
+        # sdr_tonemapped: exposure + PGTM + tone curve with clipping (display-ready)
+        gain_map, gain_metadata = compute_gain_map(sdr_tonemapped, hdr_linear)
 
         # Apply sRGB gamma to SDR for display encoding
-        sdr_gamma = apply_srgb_gamma(sdr_linear)
+        sdr_gamma = apply_srgb_gamma(sdr_tonemapped)
         _write_ppm_from_float(temp_sdr_ppm, sdr_gamma, width, height)
+
+        # Debug: Save final sRGB-encoded output (directly comparable to Apple Photos)
+        if DEBUG_MODE and DEBUG_OUTPUT_DIR is not None:
+            _save_debug_stage(
+                temp_sdr_ppm, "05_srgb_gamma", info.path.stem,
+                {"note": "sRGB encoded - comparable to Apple HEIC output"}
+            )
 
         # Write gain map as PGM (8-bit grayscale)
         _write_pgm_from_uint8(temp_gainmap_pgm, gain_map)
 
+        # Get local cjxl path and environment
+        script_dir = Path(__file__).resolve().parent
+        cjxl_path = script_dir / "build" / "deps" / "bin" / "cjxl"
+        cjxl_env = os.environ.copy()
+        cjxl_env["LD_LIBRARY_PATH"] = _get_library_path()
+
         # Encode SDR base as JXL container (Rec.2020 primaries + sRGB transfer)
         cjxl_base_cmd = [
-            "cjxl",
+            str(cjxl_path),
             str(temp_sdr_ppm),
             str(temp_base_jxl),
             "-d", "0",       # Lossless compression
@@ -1157,7 +1436,7 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             "--container=1",  # Force ISOBMFF container
         ]
 
-        result = subprocess.run(cjxl_base_cmd, capture_output=True, text=True)
+        result = subprocess.run(cjxl_base_cmd, capture_output=True, text=True, env=cjxl_env)
         if result.returncode != 0:
             raise JxlExtractionError(
                 f"cjxl base encoding failed: {result.stderr or result.stdout}"
@@ -1165,7 +1444,7 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
 
         # Encode gain map as naked JXL codestream
         cjxl_gainmap_cmd = [
-            "cjxl",
+            str(cjxl_path),
             str(temp_gainmap_pgm),
             str(temp_gainmap_jxl),
             "-d", "0",       # Lossless for gain map too
@@ -1173,7 +1452,7 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             "--container=0",  # Naked codestream (no container)
         ]
 
-        result = subprocess.run(cjxl_gainmap_cmd, capture_output=True, text=True)
+        result = subprocess.run(cjxl_gainmap_cmd, capture_output=True, text=True, env=cjxl_env)
         if result.returncode != 0:
             raise JxlExtractionError(
                 f"cjxl gain map encoding failed: {result.stderr or result.stdout}"
@@ -1262,13 +1541,13 @@ def process_image(info: ImageInfo, dest_dir: Path) -> Path:
 def process_all(
     images: list[tuple[ImageInfo, Path]],
     max_workers: int,
+    dest_dir: Path,
 ) -> None:
     """Process all images with parallel execution.
 
     Raises:
         JxlExtractionError: On image extraction failure.
     """
-    dest_dir = Path(DESTINATION_DIR)
 
     total = len(images)
     console.print(f"\n[bold blue]Processing {total} image(s)[/]")
@@ -1310,14 +1589,26 @@ def process_all(
 
 def main() -> None:
     """Script entry point."""
+    global DEBUG_MODE, DEBUG_OUTPUT_DIR, PGTM_STRENGTH
+
+    args = parse_arguments()
+
+    # Set global flags
+    DEBUG_MODE = args.debug
+    PGTM_STRENGTH = args.pgtm_strength
+    if DEBUG_MODE:
+        DEBUG_OUTPUT_DIR = args.debug_dir or (args.dest / "debug")
+        DEBUG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        console.print(f"[yellow]Debug mode enabled. Output: {DEBUG_OUTPUT_DIR}[/]\n")
+
     console.print("\n[bold]Photo Converter[/] (DNG to JXL + Image Copy)\n")
 
     try:
         # Validate environment
         validate_environment()
 
-        source_dir = Path(SOURCE_DIR)
-        dest_dir = Path(DESTINATION_DIR)
+        source_dir = args.source
+        dest_dir = args.dest
 
         # Scan for images
         image_paths = scan_images(source_dir)
@@ -1345,7 +1636,7 @@ def main() -> None:
             for path in image_paths:
                 try:
                     info = probe_image(path)
-                    should, reason = should_process_image(info, dest_dir)
+                    should, reason = should_process_image(info, dest_dir, args.force)
 
                     if should:
                         if info.should_extract_jxl:
@@ -1405,7 +1696,7 @@ def main() -> None:
             return
 
         # Process all images
-        process_all(images_to_process, MAX_WORKERS)
+        process_all(images_to_process, MAX_WORKERS, dest_dir)
 
         # Summary
         jxl_count = sum(1 for info, _ in images_to_process if info.should_extract_jxl)
