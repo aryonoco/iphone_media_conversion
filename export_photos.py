@@ -17,26 +17,23 @@
 #
 
 """
-Media Converter Script
+Photo Converter Script
 
-Converts Apple video files (.mov, .m4v) to AV1 format using SVT-AV1 encoder.
 Processes iPhone 16/17 Pro ProRAW DNG files to lossless JPEG XL.
 Copies other image formats (HEIC, HEIF, AVIF, JPEG, PNG) as-is with metadata.
 
-Video: Preserves resolution, frame rate, color space, and HDR metadata.
-       Audio streams are copied without re-encoding (unsupported codecs skipped).
-Images: DNG with JPEG XL compression → processed to lossless .jxl
+Images: DNG with JPEG XL compression -> processed to lossless .jxl
         (uses dcraw_emu_dng with DNG SDK for full RAW processing)
-        Other images and older DNGs → copied unchanged.
+        Other images and older DNGs -> copied unchanged.
 
 Prerequisites:
     - Run libraw_dng.py first to build dcraw_emu_dng
-    - Requires: ffmpeg, exiftool, cjxl
+    - Requires: exiftool, cjxl
 
 Usage:
     1. Edit the CONFIGURATION section below
-    2. Run: ./export_media.py
-    Or: uv run export_media.py
+    2. Run: ./export_photos.py
+    Or: uv run export_photos.py
 """
 
 from __future__ import annotations
@@ -47,7 +44,7 @@ import shutil
 import subprocess
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Self
 
@@ -71,18 +68,11 @@ from rich.table import Table
 # ║  Edit these variables before running the script                  ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-SOURCE_DIR: str = "/var/home/admin/Videos/src_videos"
-DESTINATION_DIR: str = "/var/home/admin/Videos/dst_videos"
-
-# SVT-AV1 Encoding Settings
-PRESET: int = 2  # 1 = slowest/best quality, 13 = fastest/lower quality
-CRF: int = 30  # 0 = lossless, 63 = worst quality (18-35 typical range)
+SOURCE_DIR: str = "/var/home/admin/Pictures/iphone-orig"
+DESTINATION_DIR: str = "/var/home/admin/Pictures/script-output"
 
 # Parallel Processing
-MAX_WORKERS: int = 6  # Number of videos to encode simultaneously
-
-# Audio Processing
-AUDIO_MODE: str = "copy"  # "copy" = passthrough, "opus" = transcode to Opus
+MAX_WORKERS: int = 6  # Number of images to process simultaneously
 
 # Tone Curve Style for DNG Processing
 # Controls the visual "look" of converted ProRAW images
@@ -91,9 +81,6 @@ TONE_CURVE_STYLE: str = "apple"  # "apple", "flat", "vivid", "film", "linear"
 # ═══════════════════════════════════════════════════════════════════
 #                        END CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════
-
-# Constants - Video
-SUPPORTED_VIDEO_EXTENSIONS: Final[frozenset[str]] = frozenset({".mov", ".m4v"})
 
 # Constants - Image
 SUPPORTED_IMAGE_EXTENSIONS: Final[frozenset[str]] = frozenset(
@@ -114,24 +101,24 @@ TONE_CURVE_PRESETS: Final[dict[str, list[tuple[float, float]] | None]] = {
     "vivid": [
         # Velvia-inspired: aggressive S-curve, crushed shadows, punchy contrast
         (0.00, 0.00),
-        (0.05, 0.02),   # Crushed shadows
-        (0.15, 0.10),   # Deep toe
-        (0.30, 0.28),   # Shadow contrast
-        (0.50, 0.55),   # Pushed midtones (+10%)
-        (0.70, 0.78),   # Highlight boost
-        (0.85, 0.92),   # Shoulder
+        (0.05, 0.02),  # Crushed shadows
+        (0.15, 0.10),  # Deep toe
+        (0.30, 0.28),  # Shadow contrast
+        (0.50, 0.55),  # Pushed midtones (+10%)
+        (0.70, 0.78),  # Highlight boost
+        (0.85, 0.92),  # Shoulder
         (1.00, 1.00),
     ],
     "film": [
         # Portra-inspired: lifted blacks, soft contrast, compressed highlights
-        (0.00, 0.05),   # Significantly lifted blacks
-        (0.08, 0.12),   # Shadow lift
-        (0.20, 0.25),   # Gentle toe
-        (0.40, 0.45),   # Lower-mid
-        (0.60, 0.62),   # Upper-mid
-        (0.80, 0.78),   # Gentle shoulder
-        (0.95, 0.88),   # Compressed highlights
-        (1.00, 0.92),   # Rolled-off whites
+        (0.00, 0.05),  # Significantly lifted blacks
+        (0.08, 0.12),  # Shadow lift
+        (0.20, 0.25),  # Gentle toe
+        (0.40, 0.45),  # Lower-mid
+        (0.60, 0.62),  # Upper-mid
+        (0.80, 0.78),  # Gentle shoulder
+        (0.95, 0.88),  # Compressed highlights
+        (1.00, 0.92),  # Rolled-off whites
     ],
     "linear": None,  # No curve applied (with -W flag)
 }
@@ -152,37 +139,6 @@ P3_LUMA_R: Final[float] = 0.2290
 P3_LUMA_G: Final[float] = 0.6917
 P3_LUMA_B: Final[float] = 0.0793
 
-SUPPORTED_AUDIO_CODECS: Final[frozenset[str]] = frozenset(
-    {
-        "aac",
-        "opus",
-        "mp3",
-        "flac",
-        "vorbis",
-        "ac3",
-        "eac3",
-        "pcm_s16le",
-        "pcm_s24le",
-        "pcm_s32le",
-        "pcm_f32le",
-        "pcm_s16be",
-        "pcm_s24be",
-        "pcm_s32be",
-        "pcm_f32be",
-        "alac",
-        "dts",
-    }
-)
-
-AV1_CODEC_NAMES: Final[frozenset[str]] = frozenset(
-    {
-        "av1",
-        "libaom-av1",
-        "libsvtav1",
-        "librav1e",
-    }
-)
-
 # Rich console for output
 console = Console()
 
@@ -196,14 +152,6 @@ class ValidationError(Exception):
     """Raised when environment validation fails."""
 
 
-class FFprobeError(Exception):
-    """Raised when ffprobe fails to analyze a video."""
-
-
-class FFmpegError(Exception):
-    """Raised when ffmpeg encoding fails."""
-
-
 class ExiftoolError(Exception):
     """Raised when exiftool fails to analyze an image."""
 
@@ -215,148 +163,6 @@ class JxlExtractionError(Exception):
 # ═══════════════════════════════════════════════════════════════════
 #                        DATA MODELS
 # ═══════════════════════════════════════════════════════════════════
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class AudioStream:
-    """Immutable audio stream metadata."""
-
-    index: int
-    codec: str
-    channels: int
-    sample_rate: int | None = None
-    bitrate: int | None = None  # bits per second from ffprobe
-    channel_layout: str | None = None  # e.g., "stereo", "5.1(side)"
-
-    @property
-    def is_supported(self) -> bool:
-        """Check if codec can be stream-copied to MP4."""
-        return self.codec in SUPPORTED_AUDIO_CODECS
-
-    @property
-    def bitrate_kbps(self) -> int:
-        """Bitrate in kbps for Opus encoding.
-
-        Uses original bitrate if available, otherwise calculates
-        from channel count (64 kbps per channel, minimum 64 kbps).
-        """
-        if self.bitrate:
-            min_kbps = max(48 * self.channels, 64)
-            return max(self.bitrate // 1000, min_kbps)
-        return max(64 * self.channels, 64)
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class VideoInfo:
-    """Immutable video file metadata from ffprobe."""
-
-    path: Path
-    codec: str
-    width: int
-    height: int
-    fps_num: int
-    fps_den: int
-    pix_fmt: str
-    color_primaries: str | None = None
-    color_trc: str | None = None
-    colorspace: str | None = None
-    has_dolby_vision: bool = False
-    audio_streams: tuple[AudioStream, ...] = field(default_factory=tuple)
-
-    @property
-    def is_av1(self) -> bool:
-        """Check if already AV1 encoded."""
-        return self.codec in AV1_CODEC_NAMES
-
-    @property
-    def fps(self) -> float:
-        """Calculate frames per second."""
-        if self.fps_den == 0:
-            return 0.0
-        return self.fps_num / self.fps_den
-
-    @property
-    def has_hdr(self) -> bool:
-        """Check if video has HDR color space."""
-        hdr_indicators = {"bt2020", "smpte2084", "arib-std-b67"}
-        return (
-            (self.color_primaries in hdr_indicators)
-            or (self.color_trc in hdr_indicators)
-            or (self.colorspace is not None and "bt2020" in self.colorspace)
-        )
-
-    @property
-    def supported_audio_streams(self) -> tuple[AudioStream, ...]:
-        """Filter to only supported audio streams."""
-        return tuple(s for s in self.audio_streams if s.is_supported)
-
-    @property
-    def resolution_label(self) -> str:
-        """Human-readable resolution label."""
-        if self.width >= 3840:
-            return "4K"
-        elif self.width >= 2560:
-            return "1440p"
-        elif self.width >= 1920:
-            return "1080p"
-        elif self.width >= 1280:
-            return "720p"
-        else:
-            return f"{self.width}x{self.height}"
-
-    @classmethod
-    def from_ffprobe(cls, path: Path, data: dict) -> Self:
-        """Factory method to parse ffprobe JSON output."""
-        video_stream: dict | None = None
-        audio_streams: list[AudioStream] = []
-
-        for stream in data.get("streams", []):
-            codec_type = stream.get("codec_type")
-
-            if codec_type == "video" and video_stream is None:
-                video_stream = stream
-            elif codec_type == "audio":
-                audio_streams.append(
-                    AudioStream(
-                        index=stream.get("index", 0),
-                        codec=stream.get("codec_name", "unknown"),
-                        channels=stream.get("channels", 2),
-                        sample_rate=int(stream.get("sample_rate", 0)) or None,
-                        bitrate=int(stream.get("bit_rate", 0)) or None,
-                        channel_layout=stream.get("channel_layout"),
-                    )
-                )
-
-        if video_stream is None:
-            raise FFprobeError(f"No video stream found in {path}")
-
-        # Parse frame rate (e.g., "120/1" or "30000/1001")
-        fps_str = video_stream.get("r_frame_rate", "30/1")
-        fps_parts = fps_str.split("/")
-        fps_num = int(fps_parts[0]) if fps_parts else 30
-        fps_den = int(fps_parts[1]) if len(fps_parts) > 1 else 1
-
-        # Detect Dolby Vision from side_data
-        has_dv = False
-        for side_data in video_stream.get("side_data_list", []):
-            if side_data.get("side_data_type") == "DOVI configuration record":
-                has_dv = True
-                break
-
-        return cls(
-            path=path,
-            codec=video_stream.get("codec_name", "unknown"),
-            width=video_stream.get("width", 0),
-            height=video_stream.get("height", 0),
-            fps_num=fps_num,
-            fps_den=fps_den,
-            pix_fmt=video_stream.get("pix_fmt", "yuv420p"),
-            color_primaries=video_stream.get("color_primaries"),
-            color_trc=video_stream.get("color_transfer"),
-            colorspace=video_stream.get("color_space"),
-            has_dolby_vision=has_dv,
-            audio_streams=tuple(audio_streams),
-        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -440,37 +246,6 @@ def validate_environment() -> None:
     Raises:
         ValidationError: If environment is invalid.
     """
-    # Check ffmpeg
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        if "libsvtav1" not in result.stdout:
-            console.print(
-                "[yellow]Warning:[/] ffmpeg may not have SVT-AV1 support. "
-                "Check with: ffmpeg -encoders | grep svtav1"
-            )
-    except FileNotFoundError:
-        raise ValidationError("ffmpeg not found in PATH")
-    except subprocess.CalledProcessError:
-        raise ValidationError("ffmpeg failed to run")
-
-    # Check ffprobe
-    try:
-        subprocess.run(
-            ["ffprobe", "-version"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except FileNotFoundError:
-        raise ValidationError("ffprobe not found in PATH")
-    except subprocess.CalledProcessError:
-        raise ValidationError("ffprobe failed to run")
-
     # Check exiftool (for image metadata)
     try:
         subprocess.run(
@@ -494,8 +269,7 @@ def validate_environment() -> None:
         )
     except FileNotFoundError:
         raise ValidationError(
-            "cjxl not found in PATH. Install libjxl: "
-            "https://github.com/libjxl/libjxl"
+            "cjxl not found in PATH. Install libjxl: https://github.com/libjxl/libjxl"
         )
     except subprocess.CalledProcessError:
         raise ValidationError("cjxl failed to run")
@@ -505,8 +279,7 @@ def validate_environment() -> None:
     dcraw_emu = script_dir / "dcraw_emu_dng"
     if not dcraw_emu.exists():
         raise ValidationError(
-            f"dcraw_emu_dng not found at {dcraw_emu}. "
-            "Run libraw_dng.py to build it."
+            f"dcraw_emu_dng not found at {dcraw_emu}. Run libraw_dng.py to build it."
         )
 
     # Test that dcraw_emu_dng can actually run with required libraries
@@ -528,12 +301,6 @@ def validate_environment() -> None:
             )
     except subprocess.TimeoutExpired:
         raise ValidationError("dcraw_emu_dng timed out during validation")
-
-    # Validate AUDIO_MODE
-    if AUDIO_MODE.lower() not in {"copy", "opus"}:
-        raise ValidationError(
-            f"Invalid AUDIO_MODE '{AUDIO_MODE}'. Must be 'copy' or 'opus'"
-        )
 
     # Validate TONE_CURVE_STYLE
     valid_styles = {"apple", "flat", "vivid", "film", "linear"}
@@ -558,135 +325,6 @@ def validate_environment() -> None:
         console.print(f"[green]Created destination directory:[/] {dest}")
     elif not dest.is_dir():
         raise ValidationError(f"Destination path is not a directory: {dest}")
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                        VIDEO PROBING
-# ═══════════════════════════════════════════════════════════════════
-
-
-def scan_videos(source_dir: Path) -> tuple[Path, ...]:
-    """Scan directory for video files with supported extensions."""
-    videos = [
-        f
-        for f in source_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
-    ]
-    return tuple(sorted(videos, key=lambda p: p.name.lower()))
-
-
-def probe_video(path: Path) -> VideoInfo:
-    """Extract video metadata using ffprobe.
-
-    Raises:
-        FFprobeError: If probing fails.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",  # Only show errors, not warnings about unknown codecs
-                "-analyzeduration",
-                "100M",  # Analyze longer to avoid warnings
-                "-probesize",
-                "100M",
-                "-print_format",
-                "json",
-                "-show_streams",
-                "-show_format",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        data = json.loads(result.stdout)
-        return VideoInfo.from_ffprobe(path, data)
-    except subprocess.CalledProcessError as e:
-        raise FFprobeError(f"ffprobe failed for {path}: {e.stderr}")
-    except json.JSONDecodeError as e:
-        raise FFprobeError(f"Failed to parse ffprobe output for {path}: {e}")
-
-
-def should_process(info: VideoInfo, dest_dir: Path) -> tuple[bool, str]:
-    """Determine if video should be processed.
-
-    Returns:
-        Tuple of (should_process, reason_if_skipped)
-    """
-    if info.is_av1:
-        return False, "Already AV1"
-
-    output_path = dest_dir / f"{info.path.stem}.mp4"
-    if output_path.exists():
-        return False, "Output exists"
-
-    return True, ""
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                        IMAGE PROBING
-# ═══════════════════════════════════════════════════════════════════
-
-
-def scan_images(source_dir: Path) -> tuple[Path, ...]:
-    """Scan directory for image files with supported extensions."""
-    images = [
-        f
-        for f in source_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
-    ]
-    return tuple(sorted(images, key=lambda p: p.name.lower()))
-
-
-def probe_image(path: Path) -> ImageInfo:
-    """Extract image metadata using exiftool.
-
-    Raises:
-        ExiftoolError: If probing fails.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "exiftool",
-                "-j",
-                "-Compression",
-                "-ImageWidth",
-                "-ImageHeight",
-                "-BitsPerSample",
-                "-ColorSpace",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        data = json.loads(result.stdout)
-        if not data:
-            raise ExiftoolError(f"No metadata found for {path}")
-        return ImageInfo.from_exiftool(path, data[0])
-    except subprocess.CalledProcessError as e:
-        raise ExiftoolError(f"exiftool failed for {path}: {e.stderr}")
-    except json.JSONDecodeError as e:
-        raise ExiftoolError(f"Failed to parse exiftool output for {path}: {e}")
-
-
-def should_process_image(info: ImageInfo, dest_dir: Path) -> tuple[bool, str]:
-    """Determine if image should be processed.
-
-    Returns:
-        Tuple of (should_process, reason_if_skipped)
-    """
-    if info.should_extract_jxl:
-        output_path = dest_dir / f"{info.path.stem}.jxl"
-    else:
-        output_path = dest_dir / info.path.name
-
-    if output_path.exists():
-        return False, "Output exists"
-
-    return True, ""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -781,7 +419,7 @@ def _get_baseline_exposure(dng_path: Path) -> float:
         )
         baseline_ev = float(result.stdout.strip())
         # Convert EV stops to linear multiplier
-        return 2 ** baseline_ev
+        return 2**baseline_ev
     except (subprocess.CalledProcessError, ValueError):
         # Default: no exposure adjustment
         return 1.0
@@ -843,7 +481,9 @@ def _extract_tone_curve(dng_path: Path) -> list[tuple[float, float]]:
 
                 values = [float(x) for x in parts[float_start:]]
                 if len(values) >= 4:
-                    return [(values[i], values[i + 1]) for i in range(0, len(values), 2)]
+                    return [
+                        (values[i], values[i + 1]) for i in range(0, len(values), 2)
+                    ]
 
         return [(0.0, 0.0), (1.0, 1.0)]  # Linear fallback
     except (subprocess.CalledProcessError, ValueError, IndexError):
@@ -917,7 +557,7 @@ def _extract_profile_gain_table_map(dng_path: Path) -> dict | None:
             "input_weights": input_weights,  # (R, G, B, min, max)
             "table": table,  # Shape: (V, H, N)
         }
-    except (subprocess.CalledProcessError, struct.error, ValueError):
+    except (subprocess.CalledProcessError, ValueError):
         return None
 
 
@@ -1040,9 +680,7 @@ def _apply_profile_gain_table_map(
     )
 
     # Stack coordinates for interpolation: (height, width) -> (height*width, 3)
-    coords = np.stack(
-        [row_grid.ravel(), col_grid.ravel(), weight_idx.ravel()], axis=1
-    )
+    coords = np.stack([row_grid.ravel(), col_grid.ravel(), weight_idx.ravel()], axis=1)
 
     # Interpolate gains
     gains = interp(coords).reshape(height, width)
@@ -1278,7 +916,9 @@ def _adjust_saturation(ppm_path: Path, factor: float) -> None:
     img = np.frombuffer(data, dtype=">u2").reshape(height, width, 3).astype(np.float32)
 
     # Calculate luminance (Display P3 coefficients, not BT.709)
-    luminance = P3_LUMA_R * img[:, :, 0] + P3_LUMA_G * img[:, :, 1] + P3_LUMA_B * img[:, :, 2]
+    luminance = (
+        P3_LUMA_R * img[:, :, 0] + P3_LUMA_G * img[:, :, 1] + P3_LUMA_B * img[:, :, 2]
+    )
 
     # Adjust saturation: output = luminance + (input - luminance) * factor
     for c in range(3):
@@ -1342,7 +982,7 @@ def _apply_display_gamma(ppm_path: Path) -> None:
     img = np.where(
         linear_mask,
         12.92 * img,
-        1.055 * np.power(np.maximum(img, 1e-10), 1.0 / 2.4) - 0.055
+        1.055 * np.power(np.maximum(img, 1e-10), 1.0 / 2.4) - 0.055,
     )
 
     # Convert back to 16-bit
@@ -1408,7 +1048,7 @@ def _apply_exposure_ramp(ppm_path: Path, exposure_ev: float) -> None:
     img = img / 65535.0
 
     # Apply exposure as linear multiplier (DNG SDK's exposure ramp)
-    exposure_mult = 2.0 ** exposure_ev
+    exposure_mult = 2.0**exposure_ev
     img = img * exposure_mult
 
     # Clip to valid range (hard clipping like DNG SDK)
@@ -1426,258 +1066,67 @@ def _apply_exposure_ramp(ppm_path: Path, exposure_ev: float) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#                        FFMPEG COMMAND BUILDER
+#                        IMAGE PROBING
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _build_audio_args(info: VideoInfo) -> list[str]:
-    """Build ffmpeg audio arguments based on AUDIO_MODE.
+def scan_images(source_dir: Path) -> tuple[Path, ...]:
+    """Scan directory for image files with supported extensions."""
+    images = [
+        f
+        for f in source_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    ]
+    return tuple(sorted(images, key=lambda p: p.name.lower()))
+
+
+def probe_image(path: Path) -> ImageInfo:
+    """Extract image metadata using exiftool.
+
+    Raises:
+        ExiftoolError: If probing fails.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "exiftool",
+                "-j",
+                "-Compression",
+                "-ImageWidth",
+                "-ImageHeight",
+                "-BitsPerSample",
+                "-ColorSpace",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(result.stdout)
+        if not data:
+            raise ExiftoolError(f"No metadata found for {path}")
+        return ImageInfo.from_exiftool(path, data[0])
+    except subprocess.CalledProcessError as e:
+        raise ExiftoolError(f"exiftool failed for {path}: {e.stderr}")
+    except json.JSONDecodeError as e:
+        raise ExiftoolError(f"Failed to parse exiftool output for {path}: {e}")
+
+
+def should_process_image(info: ImageInfo, dest_dir: Path) -> tuple[bool, str]:
+    """Determine if image should be processed.
 
     Returns:
-        List of ffmpeg arguments for audio encoding/copying.
+        Tuple of (should_process, reason_if_skipped)
     """
-    supported_audio = info.supported_audio_streams
-
-    if not supported_audio:
-        return ["-an"]
-
-    args: list[str] = []
-
-    if AUDIO_MODE.lower() == "opus":
-        # Opus transcoding at original bitrate
-        surround_layouts: list[str] = []
-
-        for idx, stream in enumerate(supported_audio):
-            args.extend(
-                [
-                    "-map",
-                    f"0:{stream.index}",
-                    f"-c:a:{idx}",
-                    "libopus",
-                    f"-b:a:{idx}",
-                    f"{stream.bitrate_kbps}k",
-                    f"-vbr:a:{idx}",
-                    "on",
-                    f"-compression_level:a:{idx}",
-                    "10",
-                    f"-application:a:{idx}",
-                    "audio",
-                ]
-            )
-
-            # Surround audio needs mapping_family 1 for proper encoding
-            if stream.channels > 2:
-                args.extend([f"-mapping_family:a:{idx}", "1"])
-                # Determine canonical layout for FFmpeg bug workaround
-                layout = {6: "5.1", 8: "7.1"}.get(stream.channels)
-                if layout:
-                    surround_layouts.append(layout)
-
-        # Apply channel layout filter for surround streams (FFmpeg bug #5718)
-        if surround_layouts:
-            # Use the first surround layout found
-            args.extend(["-af", f"aformat=channel_layouts={surround_layouts[0]}"])
+    if info.should_extract_jxl:
+        output_path = dest_dir / f"{info.path.stem}.jxl"
     else:
-        # COPY mode - passthrough (current behavior)
-        for idx, stream in enumerate(supported_audio):
-            args.extend(
-                [
-                    "-map",
-                    f"0:{stream.index}",
-                    f"-c:a:{idx}",
-                    "copy",
-                ]
-            )
+        output_path = dest_dir / info.path.name
 
-    return args
+    if output_path.exists():
+        return False, "Output exists"
 
-
-def build_ffmpeg_command(
-    info: VideoInfo,
-    output_path: Path,
-    *,
-    preset: int,
-    crf: int,
-) -> tuple[str, ...]:
-    """Construct ffmpeg command preserving video properties."""
-    # Calculate GOP size (10x framerate, max 300)
-    gop_size = min(int(info.fps * 10), 300) if info.fps > 0 else 240
-
-    # Tiling based on resolution
-    # For high quality (tune=0), use tile-columns=1 max as recommended by SVT-AV1
-    # tile-columns=2 is only beneficial for real-time/fast encodes
-    if info.width >= 1920:  # 1080p and above
-        tile_columns, tile_rows = 1, 0
-    else:
-        tile_columns, tile_rows = 0, 0
-
-    # Build SVT-AV1 params string (2025 best practices for live action)
-    # Reference: https://wiki.x266.mov/blog/svt-av1-fourth-deep-dive-p2
-    svtav1_params_list = [
-        "tune=0",  # Psychovisual optimization (VQ mode)
-        "enable-variance-boost=1",  # Better low-contrast areas (skin, clouds)
-        "enable-overlays=1",  # Detail preservation on alt-ref frames
-        "enable-tf=1",  # Temporal filtering enabled
-        "tf-strength=1",  # Reduced from default 3 to prevent blur/blocking
-        "enable-qm=1",  # Enable quantization matrices for efficiency
-        "qm-min=0",  # Lower flatness = better compression
-        "film-grain=8",  # Preserve natural grain (live action)
-        "scm=0",  # Screen content mode OFF for camera footage
-        f"tile-columns={tile_columns}",
-        f"tile-rows={tile_rows}",
-    ]
-
-    # Add luminance-qp-bias ONLY for HLG content (iPhone)
-    # Do NOT use for PQ/HDR10 as it breaks quality
-    if info.color_trc == "arib-std-b67":  # HLG
-        svtav1_params_list.append("luminance-qp-bias=40")
-
-    svtav1_params = ":".join(svtav1_params_list)
-
-    # Building command
-    cmd: list[str] = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-stats",
-        # Increase analysis duration to avoid warnings about unknown codecs
-        "-analyzeduration",
-        "100M",
-        "-probesize",
-        "100M",
-        "-i",
-        str(info.path),
-        "-map",
-        "0:v:0",
-        "-c:v",
-        "libsvtav1",
-        "-preset",
-        str(preset),
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p10le",  # Always 10-bit for quality
-        "-g",
-        str(gop_size),
-        "-svtav1-params",
-        svtav1_params,
-        "-dolbyvision",
-        "auto",  # Auto-preserve Dolby Vision Profile 8 from iPhone
-    ]
-
-    # Add color space preservation
-    if info.color_primaries:
-        cmd.extend(["-color_primaries", info.color_primaries])
-    if info.color_trc:
-        cmd.extend(["-color_trc", info.color_trc])
-    if info.colorspace:
-        cmd.extend(["-colorspace", info.colorspace])
-
-    # Map and encode/copy audio streams
-    cmd.extend(_build_audio_args(info))
-
-    # Output settings
-    cmd.extend(
-        [
-            "-map_metadata",
-            "0",
-            "-movflags",
-            "+faststart",
-            "-y",  # Overwrite (we already checked for existence)
-            str(output_path),
-        ]
-    )
-
-    return tuple(cmd)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                        VIDEO CONVERSION
-# ═══════════════════════════════════════════════════════════════════
-
-
-def convert_video(info: VideoInfo, dest_dir: Path, preset: int, crf: int) -> Path:
-    """Convert single video to AV1, returning output path.
-
-    Raises:
-        FFmpegError: If encoding fails.
-    """
-    output_path = dest_dir / f"{info.path.stem}.mp4"
-
-    cmd = build_ffmpeg_command(info, output_path, preset=preset, crf=crf)
-
-    try:
-        subprocess.run(
-            cmd,
-            check=True,
-            capture_output=False,  # Show progress
-        )
-        return output_path
-    except subprocess.CalledProcessError as e:
-        # Clean up partial file
-        if output_path.exists():
-            output_path.unlink()
-        raise FFmpegError(
-            f"Encoding failed for {info.path.name}: exit code {e.returncode}"
-        )
-
-
-def process_all(
-    videos: list[tuple[VideoInfo, Path]],
-    images: list[tuple[ImageInfo, Path]],
-    max_workers: int,
-    preset: int,
-    crf: int,
-) -> None:
-    """Process all media (videos and images) with parallel execution.
-
-    Raises:
-        FFmpegError: On video encoding failure.
-        JxlExtractionError: On image extraction failure.
-    """
-    dest_dir = Path(DESTINATION_DIR)
-
-    total = len(videos) + len(images)
-    console.print(
-        f"\n[bold blue]Processing {len(videos)} video(s) and {len(images)} image(s)[/]"
-    )
-    if videos:
-        console.print(f"  Video: Preset {preset}, CRF {crf}")
-    console.print(f"  Workers: {max_workers}\n")
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Track futures with their media info and type
-        future_to_media: dict[Future[Path], tuple[str, VideoInfo | ImageInfo]] = {}
-
-        # Submit video conversion tasks
-        for info, _ in videos:
-            future = executor.submit(convert_video, info, dest_dir, preset, crf)
-            future_to_media[future] = ("video", info)
-
-        # Submit image processing tasks
-        for info, _ in images:
-            future = executor.submit(process_image, info, dest_dir)
-            future_to_media[future] = ("image", info)
-
-        completed = 0
-
-        for future in as_completed(future_to_media):
-            media_type, info = future_to_media[future]
-            completed += 1
-
-            try:
-                output_path = future.result()
-                console.print(
-                    f"[green]✓[/] [{completed}/{total}] "
-                    f"{info.path.name} → {output_path.name}"
-                )
-            except (FFmpegError, JxlExtractionError) as e:
-                console.print(f"[red]✗[/] [{completed}/{total}] {e}")
-                # Cancel remaining futures
-                for f in future_to_media:
-                    f.cancel()
-                raise
+    return True, ""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1768,10 +1217,14 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             str(dcraw_emu),
             "-dngsdk",  # Use DNG SDK to decode JXL-compressed RAW
             "-6",  # 16-bit output
-            "-q", "3",  # AHD demosaicing (high quality)
-            "-H", highlight_mode,  # Highlight handling
-            "-o", "6",  # Output color space: DCI-P3 D65 (verified from LibRaw source)
-            "-Z", str(temp_ppm),
+            "-q",
+            "3",  # AHD demosaicing (high quality)
+            "-H",
+            highlight_mode,  # Highlight handling
+            "-o",
+            "6",  # Output color space: DCI-P3 D65 (verified from LibRaw source)
+            "-Z",
+            str(temp_ppm),
             str(info.path),
         ]
 
@@ -1814,7 +1267,7 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
         # (compensation for applying PGTM before exposure)
         if style == "apple":
             pgtm = _extract_profile_gain_table_map(info.path)
-            pgtm_exp_mult = 2.0 ** baseline_exposure_ev  # PGTM weight scaling
+            pgtm_exp_mult = 2.0**baseline_exposure_ev  # PGTM weight scaling
             if pgtm:
                 _apply_profile_gain_table_map(temp_ppm, pgtm, pgtm_exp_mult)
 
@@ -1851,9 +1304,12 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             "cjxl",
             str(temp_ppm),
             str(output_path),
-            "-d", "0",  # Lossless (distance 0)
-            "-e", "7",  # Encoding effort (1-10)
-            "-x", "color_space=DisplayP3",  # Embed Display P3 color profile
+            "-d",
+            "0",  # Lossless (distance 0)
+            "-e",
+            "7",  # Encoding effort (1-10)
+            "-x",
+            "color_space=DisplayP3",  # Embed Display P3 color profile
         ]
 
         result = subprocess.run(cjxl_cmd, capture_output=True, text=True)
@@ -1921,6 +1377,51 @@ def process_image(info: ImageInfo, dest_dir: Path) -> Path:
         return copy_image(info, dest_dir)
 
 
+def process_all(
+    images: list[tuple[ImageInfo, Path]],
+    max_workers: int,
+) -> None:
+    """Process all images with parallel execution.
+
+    Raises:
+        JxlExtractionError: On image extraction failure.
+    """
+    dest_dir = Path(DESTINATION_DIR)
+
+    total = len(images)
+    console.print(f"\n[bold blue]Processing {total} image(s)[/]")
+    console.print(f"  Style: {TONE_CURVE_STYLE}")
+    console.print(f"  Workers: {max_workers}\n")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Track futures with their image info
+        future_to_image: dict[Future[Path], ImageInfo] = {}
+
+        # Submit image processing tasks
+        for info, _ in images:
+            future = executor.submit(process_image, info, dest_dir)
+            future_to_image[future] = info
+
+        completed = 0
+
+        for future in as_completed(future_to_image):
+            info = future_to_image[future]
+            completed += 1
+
+            try:
+                output_path = future.result()
+                console.print(
+                    f"[green]\u2713[/] [{completed}/{total}] "
+                    f"{info.path.name} \u2192 {output_path.name}"
+                )
+            except JxlExtractionError as e:
+                console.print(f"[red]\u2717[/] [{completed}/{total}] {e}")
+                # Cancel remaining futures
+                for f in future_to_image:
+                    f.cancel()
+                raise
+
+
 # ═══════════════════════════════════════════════════════════════════
 #                        MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════
@@ -1928,7 +1429,7 @@ def process_image(info: ImageInfo, dest_dir: Path) -> Path:
 
 def main() -> None:
     """Script entry point."""
-    console.print("\n[bold]Media Converter[/] (AV1 Video + Image Extraction)\n")
+    console.print("\n[bold]Photo Converter[/] (DNG to JXL + Image Copy)\n")
 
     try:
         # Validate environment
@@ -1937,23 +1438,17 @@ def main() -> None:
         source_dir = Path(SOURCE_DIR)
         dest_dir = Path(DESTINATION_DIR)
 
-        # Scan for videos and images
-        video_paths = scan_videos(source_dir)
+        # Scan for images
         image_paths = scan_images(source_dir)
 
-        if not video_paths and not image_paths:
-            console.print(f"[yellow]No media files found in {source_dir}[/]")
+        if not image_paths:
+            console.print(f"[yellow]No image files found in {source_dir}[/]")
             return
 
-        console.print(
-            f"Found {len(video_paths)} video(s) and {len(image_paths)} image(s) "
-            "to analyze...\n"
-        )
+        console.print(f"Found {len(image_paths)} image(s) to analyze...\n")
 
-        # Probe and filter media
-        videos_to_process: list[tuple[VideoInfo, Path]] = []
+        # Probe and filter images
         images_to_process: list[tuple[ImageInfo, Path]] = []
-        skipped_videos: list[tuple[str, str]] = []
         skipped_images: list[tuple[str, str]] = []
 
         with Progress(
@@ -1964,156 +1459,78 @@ def main() -> None:
             TimeElapsedColumn(),
             console=console,
         ) as progress:
-            # Analyze videos
-            if video_paths:
-                task = progress.add_task(
-                    "Analyzing videos...", total=len(video_paths)
-                )
-                for path in video_paths:
-                    try:
-                        info = probe_video(path)
-                        should, reason = should_process(info, dest_dir)
+            task = progress.add_task("Analyzing images...", total=len(image_paths))
 
-                        if should:
-                            output_path = dest_dir / f"{info.path.stem}.mp4"
-                            videos_to_process.append((info, output_path))
+            for path in image_paths:
+                try:
+                    info = probe_image(path)
+                    should, reason = should_process_image(info, dest_dir)
+
+                    if should:
+                        if info.should_extract_jxl:
+                            output_path = dest_dir / f"{info.path.stem}.jxl"
                         else:
-                            skipped_videos.append((path.name, reason))
+                            output_path = dest_dir / info.path.name
+                        images_to_process.append((info, output_path))
+                    else:
+                        skipped_images.append((path.name, reason))
 
-                    except FFprobeError as e:
-                        console.print(f"[red]Error probing {path.name}:[/] {e}")
-                        raise
+                except ExiftoolError as e:
+                    console.print(f"[red]Error probing {path.name}:[/] {e}")
+                    raise
 
-                    progress.advance(task)
-
-            # Analyze images
-            if image_paths:
-                task = progress.add_task(
-                    "Analyzing images...", total=len(image_paths)
-                )
-                for path in image_paths:
-                    try:
-                        info = probe_image(path)
-                        should, reason = should_process_image(info, dest_dir)
-
-                        if should:
-                            if info.should_extract_jxl:
-                                output_path = dest_dir / f"{info.path.stem}.jxl"
-                            else:
-                                output_path = dest_dir / info.path.name
-                            images_to_process.append((info, output_path))
-                        else:
-                            skipped_images.append((path.name, reason))
-
-                    except ExiftoolError as e:
-                        console.print(f"[red]Error probing {path.name}:[/] {e}")
-                        raise
-
-                    progress.advance(task)
-
-        # Display video summary table
-        if videos_to_process or skipped_videos:
-            table = Table(title="Video Analysis Results")
-            table.add_column("File", style="cyan")
-            table.add_column("Status", style="green")
-            table.add_column("Resolution")
-            table.add_column("FPS")
-            table.add_column("Codec")
-            table.add_column("HDR")
-            table.add_column("DV")
-            table.add_column("Audio")
-
-            for info, _ in videos_to_process:
-                audio_count = len(info.supported_audio_streams)
-                total_audio = len(info.audio_streams)
-                audio_str = (
-                    f"{audio_count}/{total_audio}"
-                    if total_audio > audio_count
-                    else str(audio_count)
-                )
-
-                table.add_row(
-                    info.path.name,
-                    "[green]To Convert[/]",
-                    info.resolution_label,
-                    f"{info.fps:.2f}",
-                    info.codec.upper(),
-                    "[yellow]Yes[/]" if info.has_hdr else "No",
-                    "[magenta]Yes[/]" if info.has_dolby_vision else "No",
-                    audio_str,
-                )
-
-            for name, reason in skipped_videos:
-                table.add_row(
-                    name,
-                    f"[dim]{reason}[/]",
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                )
-
-            console.print(table)
+                progress.advance(task)
 
         # Display image summary table
-        if images_to_process or skipped_images:
-            table = Table(title="Image Analysis Results")
-            table.add_column("File", style="cyan")
-            table.add_column("Status", style="green")
-            table.add_column("Dimensions")
-            table.add_column("Format")
-            table.add_column("Compression")
-            table.add_column("Action")
+        table = Table(title="Image Analysis Results")
+        table.add_column("File", style="cyan")
+        table.add_column("Status", style="green")
+        table.add_column("Dimensions")
+        table.add_column("Format")
+        table.add_column("Compression")
+        table.add_column("Action")
 
-            for info, output_path in images_to_process:
-                if info.should_extract_jxl:
-                    action = "[blue]Process RAW[/]"
-                    status = "[green]To Process[/]"
-                else:
-                    action = "[dim]Copy[/]"
-                    status = "[green]To Copy[/]"
+        for info, output_path in images_to_process:
+            if info.should_extract_jxl:
+                action = "[blue]Process RAW[/]"
+                status = "[green]To Process[/]"
+            else:
+                action = "[dim]Copy[/]"
+                status = "[green]To Copy[/]"
 
-                table.add_row(
-                    info.path.name,
-                    status,
-                    f"{info.width}x{info.height}" if info.width else "-",
-                    info.format.upper(),
-                    info.compression or "-",
-                    action,
-                )
+            table.add_row(
+                info.path.name,
+                status,
+                f"{info.width}x{info.height}" if info.width else "-",
+                info.format.upper(),
+                info.compression or "-",
+                action,
+            )
 
-            for name, reason in skipped_images:
-                table.add_row(
-                    name,
-                    f"[dim]{reason}[/]",
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                )
+        for name, reason in skipped_images:
+            table.add_row(
+                name,
+                f"[dim]{reason}[/]",
+                "-",
+                "-",
+                "-",
+                "-",
+            )
 
-            console.print(table)
+        console.print(table)
 
-        if not videos_to_process and not images_to_process:
-            console.print("\n[yellow]No media to process.[/]")
+        if not images_to_process:
+            console.print("\n[yellow]No images to process.[/]")
             return
 
-        # Process all media
-        process_all(
-            videos_to_process, images_to_process, MAX_WORKERS, PRESET, CRF
-        )
+        # Process all images
+        process_all(images_to_process, MAX_WORKERS)
 
         # Summary
-        video_count = len(videos_to_process)
-        image_count = len(images_to_process)
         jxl_count = sum(1 for info, _ in images_to_process if info.should_extract_jxl)
-        copy_count = image_count - jxl_count
+        copy_count = len(images_to_process) - jxl_count
 
         summary_parts = []
-        if video_count:
-            summary_parts.append(f"{video_count} video(s) converted")
         if jxl_count:
             summary_parts.append(f"{jxl_count} DNG(s) processed to JXL")
         if copy_count:
@@ -2124,14 +1541,8 @@ def main() -> None:
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/]")
         sys.exit(130)
-    except FFmpegError as e:
-        console.print(f"\n[red]Video encoding failed:[/] {e}")
-        sys.exit(1)
     except JxlExtractionError as e:
         console.print(f"\n[red]DNG processing failed:[/] {e}")
-        sys.exit(1)
-    except FFprobeError as e:
-        console.print(f"\n[red]Video analysis failed:[/] {e}")
         sys.exit(1)
     except ExiftoolError as e:
         console.print(f"\n[red]Image analysis failed:[/] {e}")
