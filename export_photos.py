@@ -26,7 +26,8 @@ Images: DNG with JPEG XL compression -> processed to lossless .jxl
         (uses dcraw_emu_dng with DNG SDK for full RAW processing)
         Other images and older DNGs -> copied unchanged.
 
-Output uses Display P3 color space to preserve the wide gamut of iPhone photos.
+Output uses Rec.2020 HDR with ISO 21496-1 gain maps for adaptive HDR display.
+SDR fallback is tone-mapped and embedded as the base image.
 
 Prerequisites:
     - Run libraw_dng.py first to build dcraw_emu_dng
@@ -53,6 +54,14 @@ from typing import Final, Self
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
+from jxl_gainmap import (
+    tone_map_hdr_to_sdr_linear,
+    apply_srgb_gamma,
+    compute_gain_map,
+    serialize_iso21496_metadata,
+    serialize_jhgm_bundle,
+    insert_jhgm_box,
+)
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -982,15 +991,59 @@ def should_process_image(info: ImageInfo, dest_dir: Path) -> tuple[bool, str]:
 # ═══════════════════════════════════════════════════════════════════
 
 
-def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
-    """Process iPhone ProRAW DNG to JXL with Apple-style rendering.
+def _read_ppm_as_float(ppm_path: Path) -> tuple[np.ndarray, int, int]:
+    """Read 16-bit PPM as normalized float32 array.
 
-    Implements the full DNG SDK rendering pipeline to match Apple Photos output:
+    Returns:
+        Tuple of (image array normalized 0-1, width, height)
+    """
+    with open(ppm_path, "rb") as f:
+        magic = f.readline()
+        if magic.strip() != b"P6":
+            raise ValueError(f"Not a binary PPM file: {ppm_path}")
+        line = f.readline()
+        while line.startswith(b"#"):
+            line = f.readline()
+        dims = line.decode().split()
+        width, height = int(dims[0]), int(dims[1])
+        maxval_line = f.readline()
+        maxval = int(maxval_line.decode().strip())
+        if maxval != 65535:
+            raise ValueError(f"Expected 16-bit PPM (maxval 65535), got {maxval}")
+        data = f.read()
+    img = np.frombuffer(data, dtype=">u2").reshape(height, width, 3).astype(np.float32)
+    return img / 65535.0, width, height
+
+
+def _write_ppm_from_float(ppm_path: Path, img: np.ndarray, width: int, height: int) -> None:
+    """Write normalized float32 array as 16-bit PPM."""
+    img_out = np.clip(img * 65535.0, 0, 65535).astype(">u2")
+    with open(ppm_path, "wb") as f:
+        f.write(b"P6\n")
+        f.write(f"{width} {height}\n".encode())
+        f.write(b"65535\n")
+        f.write(img_out.tobytes())
+
+
+def _write_pgm_from_uint8(pgm_path: Path, img: np.ndarray) -> None:
+    """Write uint8 grayscale array as 8-bit PGM."""
+    height, width = img.shape
+    with open(pgm_path, "wb") as f:
+        f.write(b"P5\n")
+        f.write(f"{width} {height}\n".encode())
+        f.write(b"255\n")
+        f.write(img.tobytes())
+
+
+def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
+    """Process iPhone ProRAW DNG to JXL with HDR support and ISO 21496-1 gain map.
+
+    Implements the full DNG SDK rendering pipeline plus HDR gain map generation:
 
     Phase 1 (dcraw_emu_dng):
     - Decode JXL-compressed Linear Raw data via DNG SDK
     - Demosaic Bayer pattern to RGB using AHD algorithm
-    - Apply color matrix for DCI-P3 D65 output
+    - Apply color matrix for Rec.2020 output
     - Output 16-bit linear PPM
 
     Phase 2 (ProfileGainTableMap):
@@ -1002,16 +1055,25 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
 
     Phase 4 (Tone Curve):
     - Apply ProfileToneCurve from DNG metadata for global tonal rendering
+    - Save result as HDR reference (linear Rec.2020)
 
-    Phase 5 (Display Encoding):
-    - Apply Display P3/sRGB transfer function (gamma encoding)
-    - Encode to lossless JPEG XL with embedded Display P3 profile
+    Phase 5 (HDR Pipeline):
+    - Tone map HDR -> SDR (linear Rec.2020)
+    - Compute gain map from SDR/HDR luminance ratios
+    - Apply sRGB gamma to SDR for display encoding
+    - Encode SDR base as JXL container
+    - Encode gain map as naked JXL codestream
+    - Insert jhgm box via container surgery
 
     Raises:
         JxlExtractionError: If processing fails.
     """
     output_path = dest_dir / f"{info.path.stem}.jxl"
     temp_ppm = dest_dir / f".{info.path.stem}_temp.ppm"
+    temp_sdr_ppm = dest_dir / f".{info.path.stem}_sdr.ppm"
+    temp_gainmap_pgm = dest_dir / f".{info.path.stem}_gainmap.pgm"
+    temp_base_jxl = dest_dir / f".{info.path.stem}_base.jxl"
+    temp_gainmap_jxl = dest_dir / f".{info.path.stem}_gainmap.jxl"
 
     # Use dcraw_emu_dng from build directory
     script_dir = Path(__file__).resolve().parent
@@ -1034,7 +1096,7 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             "-6",        # 16-bit output
             "-q", "3",   # AHD demosaicing (high quality)
             "-H", "0",   # Clip highlights (exposure applied in Python)
-            "-o", "6",   # Output color space: DCI-P3 D65
+            "-o", "8",   # Output color space: Rec.2020 (for HDR pipeline)
             "-Z", str(temp_ppm),
             str(info.path),
         ]
@@ -1066,24 +1128,74 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             lut = _build_tone_curve_lut(curve_points)
             _apply_tone_curve_to_ppm(temp_ppm, lut)
 
-        # Phase 5: Apply Display P3/sRGB transfer function for display encoding
-        _apply_display_gamma(temp_ppm)
+        # Phase 5: HDR Pipeline - Generate gain map and encode with container surgery
+        # Read the post-tone-curve result as HDR reference (linear Rec.2020)
+        hdr_linear, width, height = _read_ppm_as_float(temp_ppm)
 
-        # Encode 16-bit PPM to lossless JXL with Display P3 color profile
-        cjxl_cmd = [
+        # Tone map HDR to SDR (stays linear for gain map computation)
+        sdr_linear = tone_map_hdr_to_sdr_linear(hdr_linear)
+
+        # Compute gain map from linear SDR and HDR
+        gain_map, gain_metadata = compute_gain_map(sdr_linear, hdr_linear)
+
+        # Apply sRGB gamma to SDR for display encoding
+        sdr_gamma = apply_srgb_gamma(sdr_linear)
+        _write_ppm_from_float(temp_sdr_ppm, sdr_gamma, width, height)
+
+        # Write gain map as PGM (8-bit grayscale)
+        _write_pgm_from_uint8(temp_gainmap_pgm, gain_map)
+
+        # Encode SDR base as JXL container (Rec.2020 primaries + sRGB transfer)
+        cjxl_base_cmd = [
             "cjxl",
-            str(temp_ppm),
-            str(output_path),
-            "-d", "0",   # Lossless (distance 0)
-            "-e", "7",   # Encoding effort (1-10)
-            "-x", "color_space=DisplayP3",  # Embed Display P3 color profile
+            str(temp_sdr_ppm),
+            str(temp_base_jxl),
+            "-d", "0.5",     # Slight lossy for smaller files (visually lossless)
+            "-e", "7",       # Encoding effort
+            "-x", "color_space=RGB_D65_202_Rel_SRG",  # Rec.2020 + sRGB transfer
+            "--container=1",  # Force ISOBMFF container
         ]
 
-        result = subprocess.run(cjxl_cmd, capture_output=True, text=True)
+        result = subprocess.run(cjxl_base_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise JxlExtractionError(
-                f"cjxl encoding failed: {result.stderr or result.stdout}"
+                f"cjxl base encoding failed: {result.stderr or result.stdout}"
             )
+
+        # Encode gain map as naked JXL codestream
+        cjxl_gainmap_cmd = [
+            "cjxl",
+            str(temp_gainmap_pgm),
+            str(temp_gainmap_jxl),
+            "-d", "1.0",     # Slight lossy OK for gain map
+            "-e", "5",       # Lower effort for gain map
+            "--container=0",  # Naked codestream (no container)
+        ]
+
+        result = subprocess.run(cjxl_gainmap_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise JxlExtractionError(
+                f"cjxl gain map encoding failed: {result.stderr or result.stdout}"
+            )
+
+        # Read encoded files
+        with open(temp_base_jxl, "rb") as f:
+            base_jxl_data = f.read()
+        with open(temp_gainmap_jxl, "rb") as f:
+            gainmap_codestream = f.read()
+
+        # Serialize ISO 21496-1 metadata
+        iso_metadata = serialize_iso21496_metadata(**gain_metadata)
+
+        # Serialize jhgm bundle
+        jhgm_bundle = serialize_jhgm_bundle(iso_metadata, gainmap_codestream)
+
+        # Insert jhgm box into container
+        final_jxl = insert_jhgm_box(base_jxl_data, jhgm_bundle)
+
+        # Write final output
+        with open(output_path, "wb") as f:
+            f.write(final_jxl)
 
     except JxlExtractionError:
         raise
@@ -1092,9 +1204,11 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             output_path.unlink()
         raise JxlExtractionError(f"Failed to process {info.path.name}: {e}")
     finally:
-        # Clean up temp file
-        if temp_ppm.exists():
-            temp_ppm.unlink()
+        # Clean up all temp files
+        for temp_file in [temp_ppm, temp_sdr_ppm, temp_gainmap_pgm,
+                          temp_base_jxl, temp_gainmap_jxl]:
+            if temp_file.exists():
+                temp_file.unlink()
 
     # Copy all metadata from DNG to JXL using exiftool
     try:
