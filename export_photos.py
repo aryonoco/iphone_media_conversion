@@ -26,6 +26,8 @@ Images: DNG with JPEG XL compression -> processed to lossless .jxl
         (uses dcraw_emu_dng with DNG SDK for full RAW processing)
         Other images and older DNGs -> copied unchanged.
 
+Output uses Display P3 color space to preserve the wide gamut of iPhone photos.
+
 Prerequisites:
     - Run libraw_dng.py first to build dcraw_emu_dng
     - Requires: exiftool, cjxl
@@ -74,10 +76,6 @@ DESTINATION_DIR: str = "/var/home/admin/Pictures/script-output"
 # Parallel Processing
 MAX_WORKERS: int = 6  # Number of images to process simultaneously
 
-# Tone Curve Style for DNG Processing
-# Controls the visual "look" of converted ProRAW images
-TONE_CURVE_STYLE: str = "apple"  # "apple", "flat", "vivid", "film", "linear"
-
 # ═══════════════════════════════════════════════════════════════════
 #                        END CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════
@@ -91,53 +89,6 @@ SUPPORTED_IMAGE_EXTENSIONS: Final[frozenset[str]] = frozenset(
 COPY_ONLY_EXTENSIONS: Final[frozenset[str]] = frozenset(
     {".jpg", ".jpeg", ".heic", ".heif", ".avif", ".png"}
 )
-
-# Tone curve presets for different looks
-# Format: list of (input, output) control points, normalized 0-1
-# None = extract from DNG (apple) or skip curve entirely (linear)
-TONE_CURVE_PRESETS: Final[dict[str, list[tuple[float, float]] | None]] = {
-    "apple": None,  # Extract ProfileToneCurve from DNG metadata
-    "flat": [(0.0, 0.0), (1.0, 1.0)],  # Linear passthrough
-    "vivid": [
-        # Velvia-inspired: aggressive S-curve, crushed shadows, punchy contrast
-        (0.00, 0.00),
-        (0.05, 0.02),  # Crushed shadows
-        (0.15, 0.10),  # Deep toe
-        (0.30, 0.28),  # Shadow contrast
-        (0.50, 0.55),  # Pushed midtones (+10%)
-        (0.70, 0.78),  # Highlight boost
-        (0.85, 0.92),  # Shoulder
-        (1.00, 1.00),
-    ],
-    "film": [
-        # Portra-inspired: lifted blacks, soft contrast, compressed highlights
-        (0.00, 0.05),  # Significantly lifted blacks
-        (0.08, 0.12),  # Shadow lift
-        (0.20, 0.25),  # Gentle toe
-        (0.40, 0.45),  # Lower-mid
-        (0.60, 0.62),  # Upper-mid
-        (0.80, 0.78),  # Gentle shoulder
-        (0.95, 0.88),  # Compressed highlights
-        (1.00, 0.92),  # Rolled-off whites
-    ],
-    "linear": None,  # No curve applied (with -W flag)
-}
-
-# Saturation adjustments per style (1.0 = no change)
-SATURATION_ADJUSTMENTS: Final[dict[str, float]] = {
-    "apple": 1.0,  # No adjustment - DNG has no HueSatMap data
-    "flat": 1.0,  # Neutral
-    "vivid": 1.20,  # +20% (Velvia is highly saturated)
-    "film": 0.88,  # -12% (Portra is notably desaturated)
-    "linear": 1.0,
-}
-
-# Display P3 / DCI-P3 luminance coefficients (Y row of RGB-to-XYZ matrix)
-# These differ from BT.709/sRGB (0.2126, 0.7152, 0.0722) due to different primaries
-# Source: DNG SDK dng_color_space.cpp and standard P3 colorimetry
-P3_LUMA_R: Final[float] = 0.2290
-P3_LUMA_G: Final[float] = 0.6917
-P3_LUMA_B: Final[float] = 0.0793
 
 # Rich console for output
 console = Console()
@@ -302,14 +253,6 @@ def validate_environment() -> None:
     except subprocess.TimeoutExpired:
         raise ValidationError("dcraw_emu_dng timed out during validation")
 
-    # Validate TONE_CURVE_STYLE
-    valid_styles = {"apple", "flat", "vivid", "film", "linear"}
-    if TONE_CURVE_STYLE.lower() not in valid_styles:
-        raise ValidationError(
-            f"Invalid TONE_CURVE_STYLE '{TONE_CURVE_STYLE}'. "
-            f"Must be one of: {', '.join(sorted(valid_styles))}"
-        )
-
     # Check directories
     source = Path(SOURCE_DIR)
     dest = Path(DESTINATION_DIR)
@@ -396,33 +339,6 @@ def _get_dcraw_library_path() -> str:
         paths.append(existing)
 
     return ":".join(paths)
-
-
-def _get_baseline_exposure(dng_path: Path) -> float:
-    """Read BaselineExposure from DNG and convert to linear multiplier.
-
-    iPhone ProRAW DNG files contain per-image BaselineExposure values
-    (typically 0.02 to 2.36 EV) that indicate how much to brighten the image.
-    dcraw_emu's -aexpo flag expects a linear multiplier, not EV stops.
-
-    Formula: linear_shift = 2^(baseline_exposure_ev)
-
-    Returns:
-        Linear multiplier for exposure correction (1.0 = no change).
-    """
-    try:
-        result = subprocess.run(
-            ["exiftool", "-BaselineExposure", "-n", "-s3", str(dng_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        baseline_ev = float(result.stdout.strip())
-        # Convert EV stops to linear multiplier
-        return 2**baseline_ev
-    except (subprocess.CalledProcessError, ValueError):
-        # Default: no exposure adjustment
-        return 1.0
 
 
 def _get_baseline_exposure_ev(dng_path: Path) -> float:
@@ -877,64 +793,6 @@ def _apply_tone_curve_to_ppm(ppm_path: Path, lut: np.ndarray) -> None:
         f.write(img.tobytes())
 
 
-def _adjust_saturation(ppm_path: Path, factor: float) -> None:
-    """Adjust saturation of PPM image.
-
-    Uses a simple RGB-based saturation adjustment that scales the distance
-    of each channel from the luminance value.
-
-    Formula: output = luminance + (input - luminance) * factor
-
-    Args:
-        ppm_path: Path to 16-bit PPM file (modified in place).
-        factor: Saturation multiplier (1.0 = no change, 1.2 = +20%, 0.8 = -20%).
-    """
-    if abs(factor - 1.0) < 0.001:
-        return  # No adjustment needed
-
-    # Read PPM header and data
-    with open(ppm_path, "rb") as f:
-        magic = f.readline()
-        if magic.strip() != b"P6":
-            raise ValueError(f"Not a binary PPM file: {ppm_path}")
-
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        dims = line.decode().split()
-        width, height = int(dims[0]), int(dims[1])
-
-        maxval_line = f.readline()
-        maxval = int(maxval_line.decode().strip())
-
-        data = f.read()
-
-    if maxval != 65535:
-        raise ValueError(f"Expected 16-bit PPM (maxval 65535), got {maxval}")
-
-    # Parse as big-endian 16-bit unsigned integers
-    img = np.frombuffer(data, dtype=">u2").reshape(height, width, 3).astype(np.float32)
-
-    # Calculate luminance (Display P3 coefficients, not BT.709)
-    luminance = (
-        P3_LUMA_R * img[:, :, 0] + P3_LUMA_G * img[:, :, 1] + P3_LUMA_B * img[:, :, 2]
-    )
-
-    # Adjust saturation: output = luminance + (input - luminance) * factor
-    for c in range(3):
-        img[:, :, c] = luminance + (img[:, :, c] - luminance) * factor
-
-    # Clamp and convert back to big-endian 16-bit
-    img = np.clip(img, 0, 65535).astype(">u2")
-
-    # Write PPM back
-    with open(ppm_path, "wb") as f:
-        f.write(magic)
-        f.write(f"{width} {height}\n".encode())
-        f.write(f"{maxval}\n".encode())
-        f.write(img.tobytes())
-
-
 def _apply_display_gamma(ppm_path: Path) -> None:
     """Apply sRGB transfer function for display encoding.
 
@@ -1135,35 +993,29 @@ def should_process_image(info: ImageInfo, dest_dir: Path) -> tuple[bool, str]:
 
 
 def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
-    """Process iPhone ProRAW DNG to JXL with configurable look.
+    """Process iPhone ProRAW DNG to JXL with Apple-style rendering.
 
-    Processing pipeline varies based on TONE_CURVE_STYLE:
+    Implements the full DNG SDK rendering pipeline to match Apple Photos output:
 
     Phase 1 (dcraw_emu_dng):
     - Decode JXL-compressed Linear Raw data via DNG SDK
     - Demosaic Bayer pattern to RGB using AHD algorithm
-    - Apply BaselineExposure correction (for apple/vivid/film styles)
-    - Apply color matrix and highlight handling
-    - Output to 16-bit PPM in DCI-P3 color space
+    - Apply color matrix for DCI-P3 D65 output
+    - Output 16-bit linear PPM
 
-    Phase 2 (apple style only - PGTM local tone mapping):
-    - Extract ProfileGainTableMap from DNG (DNG 1.6 local tone mapping)
-    - Apply spatially-varying gain to lift shadows, control highlights
-    - This creates the characteristic "Apple look"
+    Phase 2 (ProfileGainTableMap):
+    - Apply DNG 1.6 local tone mapping for spatially-varying adjustments
+    - Creates characteristic "Apple look" with lifted shadows
 
-    Phase 3 (global tone curve):
-    - Apply tone curve (apple=ProfileToneCurve from DNG, vivid/film=preset)
-    - Flat style uses linear curve, linear style skips entirely
+    Phase 3 (Exposure):
+    - Apply BaselineExposure correction after PGTM (DNG SDK order)
 
-    Phase 4 (saturation adjustment):
-    - Apply saturation adjustment per style
+    Phase 4 (Tone Curve):
+    - Apply ProfileToneCurve from DNG metadata for global tonal rendering
 
-    Styles:
-    - apple: Match Apple Photos (PGTM + ProfileToneCurve + slight saturation boost)
-    - flat: Low contrast for grading (linear curve, -W flag)
-    - vivid: High contrast, punchy (aggressive S-curve, +10% saturation)
-    - film: Soft contrast, warm (gentle S-curve, -5% saturation)
-    - linear: Raw sensor data (-W flag, no curve)
+    Phase 5 (Display Encoding):
+    - Apply Display P3/sRGB transfer function (gamma encoding)
+    - Encode to lossless JPEG XL with embedded Display P3 profile
 
     Raises:
         JxlExtractionError: If processing fails.
@@ -1175,81 +1027,27 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
     script_dir = Path(__file__).resolve().parent
     dcraw_emu = script_dir / "dcraw_emu_dng"
 
-    # Determine processing based on tone curve style
-    style = TONE_CURVE_STYLE.lower()
-
-    if style == "flat":
-        # For flat: apply only BaselineExposure (no arbitrary boost), use sRGB gamma
-        base_exp = _get_baseline_exposure(info.path)
-        exp_shift = base_exp  # Use per-image BaselineExposure, no additional boost
-        highlight_preserve = 0.0
-        highlight_mode = "0"  # Clip highlights
-        use_srgb_gamma = True
-    elif style == "linear":
-        # For linear: raw sensor data, no adjustments
-        exp_shift = 1.0
-        highlight_preserve = 0.0
-        highlight_mode = "0"  # Clip highlights
-        use_srgb_gamma = False
-    elif style == "apple":
-        # For apple: no exposure in dcraw - we apply it in Python after PGTM
-        # (following the DNG SDK pipeline order)
-        baseline_exposure_ev = _get_baseline_exposure_ev(info.path)
-        exp_shift = 1.0  # No exposure adjustment in dcraw
-        highlight_preserve = 0.0
-        highlight_mode = "0"  # Clip highlights (exposure applied in Python)
-        use_srgb_gamma = False
-    else:
-        # For vivid/film: use per-image BaselineExposure in dcraw
-        exp_shift = _get_baseline_exposure(info.path)
-        highlight_preserve = 0.5
-        highlight_mode = "2"  # Blend highlights
-        use_srgb_gamma = False
-        baseline_exposure_ev = None  # Not used
+    # Get baseline exposure for PGTM weight scaling and exposure ramp
+    baseline_exposure_ev = _get_baseline_exposure_ev(info.path)
 
     try:
         # Build environment with library path for dcraw_emu_dng
         env = os.environ.copy()
         env["LD_LIBRARY_PATH"] = _get_dcraw_library_path()
 
-        # Phase 1: Process RAW to 16-bit PPM using dcraw_emu_dng with DNG SDK
+        # Phase 1: Process RAW to 16-bit linear PPM using dcraw_emu_dng
         dcraw_cmd = [
             str(dcraw_emu),
-            "-dngsdk",  # Use DNG SDK to decode JXL-compressed RAW
-            "-6",  # 16-bit output
-            "-q",
-            "3",  # AHD demosaicing (high quality)
-            "-H",
-            highlight_mode,  # Highlight handling
-            "-o",
-            "6",  # Output color space: DCI-P3 D65 (verified from LibRaw source)
-            "-Z",
-            str(temp_ppm),
+            "-W",        # Disable auto-brightness
+            "-g", "1", "1",  # Linear output (gamma applied in Python)
+            "-dngsdk",   # Use DNG SDK to decode JXL-compressed RAW
+            "-6",        # 16-bit output
+            "-q", "3",   # AHD demosaicing (high quality)
+            "-H", "0",   # Clip highlights (exposure applied in Python)
+            "-o", "6",   # Output color space: DCI-P3 D65
+            "-Z", str(temp_ppm),
             str(info.path),
         ]
-
-        # Add exposure adjustment for styles that apply it in dcraw (not apple)
-        if style != "apple":
-            dcraw_cmd.insert(7, "-aexpo")
-            dcraw_cmd.insert(8, f"{exp_shift:.4f}")
-            dcraw_cmd.insert(9, f"{highlight_preserve:.1f}")
-
-        # Add -W flag to disable auto-brightness (needed for all styles except default)
-        if style in ("flat", "linear", "apple", "vivid", "film"):
-            dcraw_cmd.insert(1, "-W")
-
-        # Add gamma flags based on style
-        if use_srgb_gamma:
-            # sRGB gamma for flat style (2.4 gamma with 12.92 linear slope)
-            dcraw_cmd.insert(1, "-g")
-            dcraw_cmd.insert(2, "2.4")
-            dcraw_cmd.insert(3, "12.92")
-        elif style in ("apple", "vivid", "film"):
-            # Linear output for styles that apply PGTM/tone curve in Python
-            # (we apply display gamma after all processing)
-            dcraw_cmd.insert(1, "-g")
-            dcraw_cmd.insert(2, "1")
-            dcraw_cmd.insert(3, "1")
 
         result = subprocess.run(dcraw_cmd, capture_output=True, text=True, env=env)
         if result.returncode != 0:
@@ -1262,54 +1060,33 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
                 f"dcraw_emu_dng did not produce output file for {info.path.name}"
             )
 
-        # Phase 2: Apply ProfileGainTableMap for apple style (local tone mapping)
-        # Note: PGTM uses exp_weight = 2^BaselineExposure for weight scaling
-        # (compensation for applying PGTM before exposure)
-        if style == "apple":
-            pgtm = _extract_profile_gain_table_map(info.path)
-            pgtm_exp_mult = 2.0**baseline_exposure_ev  # PGTM weight scaling
-            if pgtm:
-                _apply_profile_gain_table_map(temp_ppm, pgtm, pgtm_exp_mult)
+        # Phase 2: Apply ProfileGainTableMap for local tone mapping
+        # PGTM weight is scaled by exposure to compensate for applying PGTM before exposure
+        pgtm = _extract_profile_gain_table_map(info.path)
+        pgtm_exp_mult = 2.0 ** baseline_exposure_ev
+        if pgtm:
+            _apply_profile_gain_table_map(temp_ppm, pgtm, pgtm_exp_mult)
 
-        # Phase 2.5: Apply exposure ramp AFTER PGTM (DNG SDK pipeline order)
-        # This is the actual exposure boost - applied as simple linear multiply
-        if style == "apple":
-            _apply_exposure_ramp(temp_ppm, baseline_exposure_ev)
+        # Phase 3: Apply exposure ramp after PGTM (DNG SDK pipeline order)
+        _apply_exposure_ramp(temp_ppm, baseline_exposure_ev)
 
-        # Phase 3: Apply global tone curve based on style
-        if style == "linear":
-            pass  # Skip tone curve entirely for linear output
-        else:
-            if style == "apple":
-                curve_points = _extract_tone_curve(info.path)
-            else:
-                curve_points = TONE_CURVE_PRESETS.get(style)
+        # Phase 4: Apply ProfileToneCurve from DNG for global tonal rendering
+        curve_points = _extract_tone_curve(info.path)
+        if curve_points and len(curve_points) > 2:
+            lut = _build_tone_curve_lut(curve_points)
+            _apply_tone_curve_to_ppm(temp_ppm, lut)
 
-            if curve_points and len(curve_points) > 2:
-                lut = _build_tone_curve_lut(curve_points)
-                _apply_tone_curve_to_ppm(temp_ppm, lut)
-
-        # Phase 4: Apply saturation adjustment
-        sat_factor = SATURATION_ADJUSTMENTS.get(style, 1.0)
-        if sat_factor != 1.0:
-            _adjust_saturation(temp_ppm, sat_factor)
-
-        # Phase 5: Apply display gamma for styles using linear dcraw output
-        # (sRGB transfer function for Display P3 encoding)
-        if style in ("apple", "vivid", "film"):
-            _apply_display_gamma(temp_ppm)
+        # Phase 5: Apply Display P3/sRGB transfer function for display encoding
+        _apply_display_gamma(temp_ppm)
 
         # Encode 16-bit PPM to lossless JXL with Display P3 color profile
         cjxl_cmd = [
             "cjxl",
             str(temp_ppm),
             str(output_path),
-            "-d",
-            "0",  # Lossless (distance 0)
-            "-e",
-            "7",  # Encoding effort (1-10)
-            "-x",
-            "color_space=DisplayP3",  # Embed Display P3 color profile
+            "-d", "0",   # Lossless (distance 0)
+            "-e", "7",   # Encoding effort (1-10)
+            "-x", "color_space=DisplayP3",  # Embed Display P3 color profile
         ]
 
         result = subprocess.run(cjxl_cmd, capture_output=True, text=True)
@@ -1390,7 +1167,6 @@ def process_all(
 
     total = len(images)
     console.print(f"\n[bold blue]Processing {total} image(s)[/]")
-    console.print(f"  Style: {TONE_CURVE_STYLE}")
     console.print(f"  Workers: {max_workers}\n")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:

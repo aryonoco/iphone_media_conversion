@@ -568,3 +568,11 @@ docker-compose.override.yaml
 **/.obsidian-sync-conflict-*
 **/.trash/
 **/*sync-conflict-*
+
+
+##################################
+# Project-specific               #
+##################################
+
+# DNG SDK downloads (large, versioned folders)
+dng_sdk_*/
