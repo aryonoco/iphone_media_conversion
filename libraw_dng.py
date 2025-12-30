@@ -236,8 +236,9 @@ class Builder:
     def _build_env(self, extra_env: Environment | None = None) -> Environment:
         """Build environment dict with appropriate compiler and paths.
 
-        With Homebrew (Linux/macOS): uses clang from llvm package with libc++.
-        On systems with native package managers: uses system gcc/g++.
+        Always uses clang with libc++ to avoid GCC 14+ compatibility issues.
+        - With Homebrew: uses clang from llvm package with libc++.
+        - With system package managers: uses system clang with libc++.
         """
         env = dict(os.environ)
 
@@ -300,9 +301,14 @@ class Builder:
             ]
             env["LIBRARY_PATH"] = ":".join(p for p in lib_path if p)
         else:
-            # System package managers: use standard gcc/g++
-            env.setdefault("CC", "gcc")
-            env.setdefault("CXX", "g++")
+            # System package managers: use clang with libc++ (avoids GCC 14+ issues)
+            env.setdefault("CC", "clang")
+            env.setdefault("CXX", "clang++")
+            # Add libc++ flags for system clang
+            existing_cxxflags = env.get("CXXFLAGS", "")
+            existing_ldflags = env.get("LDFLAGS", "")
+            env["CXXFLAGS"] = f"-stdlib=libc++ {existing_cxxflags}".strip()
+            env["LDFLAGS"] = f"-stdlib=libc++ {existing_ldflags}".strip()
 
         return env
 
@@ -418,10 +424,15 @@ class Builder:
     def _install_dnf_deps(self) -> None:
         """Install dependencies via DNF (Fedora/RHEL)."""
         packages = [
-            "gcc", "gcc-c++", "cmake", "make",
-            "autoconf", "automake", "libtool", "pkg-config",
+            # Compiler toolchain: clang with libc++ (avoids GCC 14+ issues)
+            "clang", "llvm", "libcxx", "libcxx-devel", "libcxxabi-devel",
+            "libomp-devel",
+            # Build tools
+            "cmake", "make", "autoconf", "automake", "libtool", "pkg-config",
+            # Libraries
             "zlib-devel", "libjpeg-turbo-devel", "lcms2-devel", "libpng-devel",
             "brotli-devel", "highway-devel", "expat-devel", "libuuid-devel",
+            # Utilities
             "git", "unzip", "wget",
         ]
         self.run(["sudo", "dnf", "install", "-y", *packages])
@@ -429,10 +440,14 @@ class Builder:
     def _install_apt_deps(self) -> None:
         """Install dependencies via APT (Debian/Ubuntu)."""
         packages = [
-            "build-essential", "cmake",
-            "autoconf", "automake", "libtool", "pkg-config",
+            # Compiler toolchain: clang with libc++ (avoids GCC 14+ issues)
+            "clang", "llvm", "libc++-dev", "libc++abi-dev", "libomp-dev",
+            # Build tools
+            "cmake", "make", "autoconf", "automake", "libtool", "pkg-config",
+            # Libraries
             "zlib1g-dev", "libjpeg-dev", "liblcms2-dev", "libpng-dev",
             "libbrotli-dev", "libhwy-dev", "libexpat1-dev", "uuid-dev",
+            # Utilities
             "git", "unzip", "wget",
         ]
         self.run(["sudo", "apt-get", "update"])
@@ -441,10 +456,14 @@ class Builder:
     def _install_pacman_deps(self) -> None:
         """Install dependencies via Pacman (Arch)."""
         packages = [
-            "base-devel", "cmake",
-            "autoconf", "automake", "libtool", "pkgconf",
+            # Compiler toolchain: clang with libc++ (avoids GCC 14+ issues)
+            "clang", "llvm", "libc++", "openmp",
+            # Build tools
+            "cmake", "make", "autoconf", "automake", "libtool", "pkgconf",
+            # Libraries
             "zlib", "libjpeg-turbo", "lcms2", "libpng",
             "brotli", "highway", "expat",
+            # Utilities
             "git", "unzip", "wget",
         ]
         self.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", *packages])
@@ -618,26 +637,26 @@ class Builder:
         if not src.exists():
             raise BuildError(f"libjxl not found at {src}. Call download_sdks() first.")
 
-        # Build flags for cmake (needed to find headers and libraries)
-        # Use clang with libc++ for consistency across platforms
-        cxx_flags_parts: list[str] = []
-        linker_flags_parts: list[str] = []
+        # Build flags for cmake - always use clang with libc++
+        cxx_flags_parts: list[str] = ["-stdlib=libc++"]
+        linker_flags_parts: list[str] = ["-stdlib=libc++"]
+
         prefix = self.brew_prefix
         if prefix is not None:
+            # Homebrew: add LLVM-specific paths
             llvm_include = prefix / "opt" / "llvm" / "include"
             llvm_lib = prefix / "opt" / "llvm" / "lib"
-            # Use libc++ (clang's native C++ standard library)
             cxx_flags_parts.extend([
-                "-stdlib=libc++",
                 f"-I{llvm_include}/c++/v1",
                 f"-I{prefix}/include",
             ])
             linker_flags_parts.extend([
-                "-stdlib=libc++",
                 f"-L{llvm_lib}",
                 f"-L{prefix}/lib",
                 f"-L{prefix}/opt/zlib/lib",
             ])
+        # System clang: libc++ paths are found automatically
+
         cxx_flags = " ".join(cxx_flags_parts)
         linker_flags = " ".join(linker_flags_parts)
 
@@ -726,15 +745,17 @@ list(FILTER ALL_SOURCES EXCLUDE REGEX ".*Host_IO-Win\\\\.cpp$")
             platform_defines = "-DUNIX_ENV=1"
             platform_excludes = ""
 
-        # Build flags for Homebrew (clang/libc++)
-        cxx_flags = ""
-        linker_flags = ""
+        # Build flags - always use clang with libc++
+        cxx_flags = "-stdlib=libc++"
+        linker_flags = "-stdlib=libc++"
         prefix = self.brew_prefix
         if prefix is not None:
+            # Homebrew: add LLVM-specific paths
             llvm_include = prefix / "opt" / "llvm" / "include"
             llvm_lib = prefix / "opt" / "llvm" / "lib"
             cxx_flags = f"-stdlib=libc++ -I{llvm_include}/c++/v1"
             linker_flags = f"-stdlib=libc++ -L{llvm_lib} -L{prefix}/lib"
+        # System clang: libc++ paths are found automatically
 
         # Create CMakeLists.txt for complete XMP SDK
         cmake_content = f"""\
@@ -885,13 +906,14 @@ install(DIRECTORY {public_include}/ DESTINATION include/xmp
         xmp_toolkit = self._dng_sdk_dir / "xmp" / "toolkit"
         xmp_public_include = xmp_toolkit / "public" / "include"
 
-        # Build additional paths for Homebrew (using llvm/libc++)
+        # Build flags - always use clang with libc++
         extra_include_dirs = ""
         extra_lib_dirs = ""
-        cxx_flags = ""
-        linker_flags = ""
+        cxx_flags = "-stdlib=libc++"
+        linker_flags = "-stdlib=libc++"
         prefix = self.brew_prefix
         if prefix is not None:
+            # Homebrew: add LLVM-specific paths
             llvm_include = prefix / "opt" / "llvm" / "include"
             llvm_lib = prefix / "opt" / "llvm" / "lib"
             jpeg_include = prefix / "opt" / "jpeg-turbo" / "include"
@@ -899,6 +921,7 @@ install(DIRECTORY {public_include}/ DESTINATION include/xmp
             extra_lib_dirs = f"\n    {llvm_lib}\n    {prefix}/lib"
             cxx_flags = f"-stdlib=libc++ -I{llvm_include}/c++/v1"
             linker_flags = f"-stdlib=libc++ -L{llvm_lib} -L{prefix}/lib"
+        # System clang: libc++ paths are found automatically
 
         # Determine platform define
         is_linux = sys.platform.startswith("linux")
@@ -1009,20 +1032,17 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
                 prefix / "opt" / "zlib" / "lib",
             ])
 
-        # Build with libc++ when using Homebrew (clang)
+        # Build with clang and libc++ (always)
         # Need to define qLinux for DNG SDK headers and UNIX_ENV/XMP_UNIXBuild for XMP
         is_linux = sys.platform.startswith("linux")
         platform_defines = "-DqLinux=1 -DUNIX_ENV=1 -DXMP_UNIXBuild=1" if is_linux else "-DqMacOS=1 -DMAC_ENV=1"
-        cxxflags = f"-O2 -DUSE_DNGSDK=1 {platform_defines}"
+        cxxflags = f"-stdlib=libc++ -O2 -DUSE_DNGSDK=1 {platform_defines}"
         libs = (
-            "-ldng -lXMPCore -ljxl -ljxl_threads -lhwy "
+            "-lc++ -lomp "  # libc++ and LLVM OpenMP
+            "-ldng -lXMPCore -ljxl -ljxl_cms -ljxl_threads -lhwy "
             "-lbrotlienc -lbrotlidec -lbrotlicommon "
             "-ljpeg -lz -lpthread -lm"
         )
-        if prefix is not None:
-            cxxflags = f"-stdlib=libc++ {cxxflags}"
-            # Add libc++ and OpenMP from LLVM
-            libs = f"-lc++ -lomp {libs}"
 
         # Build LD_LIBRARY_PATH for runtime library search (needed for configure tests)
         ld_lib_paths = [str(d) for d in lib_dirs]
@@ -1073,9 +1093,9 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
         # Output to build directory
         output_binary = self.config.install_prefix / "dcraw_emu_dng"
 
-        # Get compiler from build environment (clang for Homebrew, g++ for system)
+        # Get compiler from build environment (always clang)
         build_env = self._build_env()
-        cxx = build_env.get("CXX", "g++")
+        cxx = build_env.get("CXX", "clang++")
 
         # Build paths
         all_includes: list[str] = [
@@ -1088,18 +1108,12 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
             *(str(p) for p in lib_dirs),
         ]
 
-        # Choose C++ library based on compiler (libc++ for clang, libstdc++ for gcc)
-        # Also add OpenMP library for LibRaw's parallel processing
-        cxx_libs: list[str] = []
+        # Always use clang with libc++ and LLVM OpenMP
+        cxx_stdlib_flag = "-stdlib=libc++"
+        cxx_libs = ["-lc++", "-lomp"]
         if self.brew_prefix is not None:
-            # Using clang with libc++ and OpenMP from LLVM
-            cxx_stdlib_flag = "-stdlib=libc++"
-            cxx_libs = ["-lc++", "-lomp"]
+            # Homebrew: add LLVM lib path
             all_libs.append(f"{self.brew_prefix}/opt/llvm/lib")
-        else:
-            # Using system gcc with libstdc++ and OpenMP
-            cxx_stdlib_flag = ""
-            cxx_libs = ["-lstdc++", "-lgomp"]
 
         # Platform defines needed for DNG SDK headers
         is_linux = sys.platform.startswith("linux")
@@ -1114,7 +1128,7 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
             *(f"-I{p}" for p in all_includes),
             "samples/dcraw_emu.cpp",
             *(f"-L{p}" for p in all_libs),
-            "-lraw", "-ldng", "-lXMPCore", "-ljxl", "-ljxl_threads", "-lhwy",
+            "-lraw", "-ldng", "-lXMPCore", "-ljxl", "-ljxl_cms", "-ljxl_threads", "-lhwy",
             "-lbrotlienc", "-lbrotlidec", "-lbrotlicommon",
             "-ljpeg", "-llcms2", "-lz", "-lpthread", "-lm", *cxx_libs,
             "-o", str(output_binary),
