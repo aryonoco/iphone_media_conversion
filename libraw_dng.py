@@ -14,10 +14,6 @@
 """
 Build LibRaw with Adobe DNG SDK support for iPhone 16/17 Pro JPEG-XL DNG files.
 
-Works on Fedora, Debian/Ubuntu, Arch, and systems with Homebrew (Linux or macOS).
-
-The Adobe DNG SDK is downloaded automatically from Adobe's servers.
-
 Adobe DNG SDK: https://helpx.adobe.com/camera-raw/digital-negative.html
 LibRaw: https://www.libraw.org/
 """
@@ -82,6 +78,7 @@ class PackageManager(StrEnum):
     DNF = auto()
     APT = auto()
     PACMAN = auto()
+    ZYPPER = auto()
     UNKNOWN = auto()
 
 
@@ -124,6 +121,34 @@ def _get_script_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _is_root() -> bool:
+    """Check if running as root."""
+    return os.geteuid() == 0
+
+
+def _check_sudo_available() -> bool:
+    """Check if sudo is available."""
+    return shutil.which("sudo") is not None
+
+
+def _privileged_cmd(cmd: list[str]) -> list[str]:
+    """Wrap command with sudo if not running as root.
+
+    If running as root, returns the command unchanged.
+    If not root but sudo is unavailable, raises BuildError with instructions.
+    """
+    if _is_root():
+        return cmd
+    if not _check_sudo_available():
+        raise BuildError(
+            "This script requires root privileges to install system packages.\n"
+            "Please run with sudo or as root:\n"
+            f"  sudo {sys.executable} {' '.join(sys.argv)}\n"
+            "Or install dependencies manually and use --skip-deps"
+        )
+    return ["sudo", *cmd]
+
+
 @dataclass(slots=True, kw_only=True)
 class BuildConfig:
     """Build configuration."""
@@ -164,9 +189,7 @@ class BuildConfig:
         """Create config from arguments with environment variable fallbacks."""
         return cls(
             build_dir=(
-                build_dir
-                or _get_env_path("BUILD_DIR")
-                or _get_script_dir() / "build"
+                build_dir or _get_env_path("BUILD_DIR") or _get_script_dir() / "build"
             ),
             install_prefix=(
                 install_prefix
@@ -379,6 +402,8 @@ class Builder:
             return PackageManager.APT
         if shutil.which("pacman"):
             return PackageManager.PACMAN
+        if shutil.which("zypper"):
+            return PackageManager.ZYPPER
 
         # If prefer_system_pkg but no system manager found, try Homebrew
         if self.brew_prefix is not None:
@@ -391,6 +416,20 @@ class Builder:
         pkg_manager = self.detect_package_manager()
         self._logger.info("Using package manager: %s", pkg_manager)
 
+        # Log privilege mode for system package managers
+        if pkg_manager in (
+            PackageManager.DNF,
+            PackageManager.APT,
+            PackageManager.PACMAN,
+            PackageManager.ZYPPER,
+        ):
+            if _is_root():
+                self._logger.info("Running as root, no sudo needed")
+            else:
+                self._logger.info(
+                    "Running as user, will use sudo for package installation"
+                )
+
         match pkg_manager:
             case PackageManager.HOMEBREW:
                 self._install_homebrew_deps()
@@ -400,6 +439,8 @@ class Builder:
                 self._install_apt_deps()
             case PackageManager.PACMAN:
                 self._install_pacman_deps()
+            case PackageManager.ZYPPER:
+                self._install_zypper_deps()
             case PackageManager.UNKNOWN:
                 raise BuildError(
                     "No supported package manager found. "
@@ -412,12 +453,23 @@ class Builder:
 
         packages = [
             # Build tools - use llvm (clang with libc++) to avoid GCC 15 + glibc issues
-            "cmake", "autoconf", "automake", "libtool", "pkg-config",
+            "cmake",
+            "autoconf",
+            "automake",
+            "libtool",
+            "pkg-config",
             "llvm",  # Provides clang/clang++ with libc++
             # Libraries
-            "zlib", "jpeg-turbo", "little-cms2", "libpng", "brotli", "highway",
+            "zlib",
+            "jpeg-turbo",
+            "little-cms2",
+            "libpng",
+            "brotli",
+            "highway",
             # Utilities
-            "git", "wget", "unzip",
+            "git",
+            "wget",
+            "unzip",
         ]
         self.run(["brew", "install", *packages])
 
@@ -425,48 +477,133 @@ class Builder:
         """Install dependencies via DNF (Fedora/RHEL)."""
         packages = [
             # Compiler toolchain: clang with libc++ (avoids GCC 14+ issues)
-            "clang", "llvm", "libcxx", "libcxx-devel", "libcxxabi-devel",
+            "clang",
+            "llvm",
+            "libcxx",
+            "libcxx-devel",
+            "libcxxabi-devel",
             "libomp-devel",
             # Build tools
-            "cmake", "make", "autoconf", "automake", "libtool", "pkg-config",
+            "cmake",
+            "make",
+            "autoconf",
+            "automake",
+            "libtool",
+            "pkg-config",
             # Libraries
-            "zlib-devel", "libjpeg-turbo-devel", "lcms2-devel", "libpng-devel",
-            "brotli-devel", "highway-devel", "expat-devel", "libuuid-devel",
+            "zlib-devel",
+            "libjpeg-turbo-devel",
+            "lcms2-devel",
+            "libpng-devel",
+            "brotli-devel",
+            "highway-devel",
+            "expat-devel",
+            "libuuid-devel",
             # Utilities
-            "git", "unzip", "wget",
+            "git",
+            "unzip",
+            "wget",
         ]
-        self.run(["sudo", "dnf", "install", "-y", *packages])
+        self.run(_privileged_cmd(["dnf", "install", "-y", *packages]))
 
     def _install_apt_deps(self) -> None:
         """Install dependencies via APT (Debian/Ubuntu)."""
         packages = [
             # Compiler toolchain: clang with libc++ (avoids GCC 14+ issues)
-            "clang", "llvm", "libc++-dev", "libc++abi-dev", "libomp-dev",
+            "clang",
+            "llvm",
+            "libc++-dev",
+            "libc++abi-dev",
+            "libomp-dev",
             # Build tools
-            "cmake", "make", "autoconf", "automake", "libtool", "pkg-config",
+            "cmake",
+            "make",
+            "autoconf",
+            "automake",
+            "libtool",
+            "pkg-config",
             # Libraries
-            "zlib1g-dev", "libjpeg-dev", "liblcms2-dev", "libpng-dev",
-            "libbrotli-dev", "libhwy-dev", "libexpat1-dev", "uuid-dev",
+            "zlib1g-dev",
+            "libjpeg-dev",
+            "liblcms2-dev",
+            "libpng-dev",
+            "libbrotli-dev",
+            "libhwy-dev",
+            "libexpat1-dev",
+            "uuid-dev",
             # Utilities
-            "git", "unzip", "wget",
+            "git",
+            "unzip",
+            "wget",
         ]
-        self.run(["sudo", "apt-get", "update"])
-        self.run(["sudo", "apt-get", "install", "-y", *packages])
+        self.run(_privileged_cmd(["apt-get", "update"]))
+        self.run(_privileged_cmd(["apt-get", "install", "-y", *packages]))
 
     def _install_pacman_deps(self) -> None:
         """Install dependencies via Pacman (Arch)."""
         packages = [
             # Compiler toolchain: clang with libc++ (avoids GCC 14+ issues)
-            "clang", "llvm", "libc++", "openmp",
+            "clang",
+            "llvm",
+            "libc++",
+            "openmp",
             # Build tools
-            "cmake", "make", "autoconf", "automake", "libtool", "pkgconf",
+            "cmake",
+            "make",
+            "autoconf",
+            "automake",
+            "libtool",
+            "pkgconf",
             # Libraries
-            "zlib", "libjpeg-turbo", "lcms2", "libpng",
-            "brotli", "highway", "expat",
+            "zlib",
+            "libjpeg-turbo",
+            "lcms2",
+            "libpng",
+            "brotli",
+            "highway",
+            "expat",
             # Utilities
-            "git", "unzip", "wget",
+            "git",
+            "unzip",
+            "wget",
         ]
-        self.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", *packages])
+        self.run(
+            _privileged_cmd(["pacman", "-S", "--needed", "--noconfirm", *packages])
+        )
+
+    def _install_zypper_deps(self) -> None:
+        """Install dependencies via Zypper (openSUSE)."""
+        packages = [
+            # Compiler toolchain: clang with libc++ (avoids GCC 14+ issues)
+            "clang",
+            "llvm",
+            "libc++-devel",
+            "libc++abi-devel",
+            "libomp-devel",
+            # Build tools
+            "cmake",
+            "make",
+            "autoconf",
+            "automake",
+            "libtool",
+            "pkgconf-pkg-config",
+            # Libraries (development packages)
+            "zlib-devel",
+            "libjpeg8-devel",
+            "liblcms2-devel",
+            "libpng16-devel",
+            "libbrotli-devel",
+            "highway-devel",
+            "libexpat-devel",
+            # For XMP SDK
+            "libuuid-devel",
+            # Utilities
+            "git",
+            "unzip",
+            "wget",
+            "gawk",
+        ]
+        self.run(_privileged_cmd(["zypper", "-n", "install", *packages]))
 
     def _download_dng_sdk(self) -> Path:
         """Download DNG SDK from Adobe, following redirect to get actual file.
@@ -481,8 +618,16 @@ class Builder:
         try:
             # First, get the final URL after redirect using curl
             result = subprocess.run(
-                ["curl", "-sI", "-L", "-o", "/dev/null", "-w", "%{url_effective}",
-                 _DNG_SDK_DOWNLOAD_URL],
+                [
+                    "curl",
+                    "-sI",
+                    "-L",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{url_effective}",
+                    _DNG_SDK_DOWNLOAD_URL,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -505,8 +650,14 @@ class Builder:
 
             # Download with curl (handles HTTP/2, shows progress)
             result = subprocess.run(
-                ["curl", "-L", "-o", str(dest_path), "--progress-bar",
-                 _DNG_SDK_DOWNLOAD_URL],
+                [
+                    "curl",
+                    "-L",
+                    "-o",
+                    str(dest_path),
+                    "--progress-bar",
+                    _DNG_SDK_DOWNLOAD_URL,
+                ],
                 timeout=600,  # 10 min for ~80MB
                 check=True,
             )
@@ -521,8 +672,7 @@ class Builder:
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise BuildError(
-                f"Download timed out after 10 minutes\n"
-                f"URL: {_DNG_SDK_DOWNLOAD_URL}"
+                f"Download timed out after 10 minutes\nURL: {_DNG_SDK_DOWNLOAD_URL}"
             ) from exc
         except FileNotFoundError:
             raise BuildError(
@@ -533,14 +683,14 @@ class Builder:
         """Extract version info from DNG SDK zip filename."""
         # Try to parse version from filename like: dng_sdk_1_7_1_2410_20251117.zip
         name = zip_path.stem  # Remove .zip
-        
+
         # Try to extract version components
         # Pattern: dng_sdk_MAJOR_MINOR_PATCH_BUILD_DATE or dng_sdk_MAJOR_MINOR_PATCH
         match = re.match(
             r"dng_sdk_(\d+)_(\d+)_(\d+)(?:_(\d+))?(?:_(\d+))?",
             name,
         )
-        
+
         if match:
             major, minor, patch, build, date = match.groups()
             version = f"{major}.{minor}.{patch}"
@@ -551,7 +701,7 @@ class Builder:
                 if len(date) == 8:
                     version += f", {date[:4]}-{date[4:6]}-{date[6:]}"
             return version
-        
+
         # Fallback: just use the filename
         return name
 
@@ -646,15 +796,19 @@ class Builder:
             # Homebrew: add LLVM-specific paths
             llvm_include = prefix / "opt" / "llvm" / "include"
             llvm_lib = prefix / "opt" / "llvm" / "lib"
-            cxx_flags_parts.extend([
-                f"-I{llvm_include}/c++/v1",
-                f"-I{prefix}/include",
-            ])
-            linker_flags_parts.extend([
-                f"-L{llvm_lib}",
-                f"-L{prefix}/lib",
-                f"-L{prefix}/opt/zlib/lib",
-            ])
+            cxx_flags_parts.extend(
+                [
+                    f"-I{llvm_include}/c++/v1",
+                    f"-I{prefix}/include",
+                ]
+            )
+            linker_flags_parts.extend(
+                [
+                    f"-L{llvm_lib}",
+                    f"-L{prefix}/lib",
+                    f"-L{prefix}/opt/zlib/lib",
+                ]
+            )
         # System clang: libc++ paths are found automatically
 
         cxx_flags = " ".join(cxx_flags_parts)
@@ -664,9 +818,13 @@ class Builder:
         all_cxx_flags = f"{cxx_flags} {linker_flags}".strip()
 
         cmake_args = [
-            "cmake", "-B", "build",
+            "cmake",
+            "-B",
+            "build",
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DCMAKE_INSTALL_PREFIX={self.config.deps_dir}",
+            # Force lib/ instead of lib64/ on Fedora/RHEL
+            "-DCMAKE_INSTALL_LIBDIR=lib",
             # Pass flags via CXX_FLAGS so cmake's try_compile tests inherit them
             f"-DCMAKE_CXX_FLAGS={all_cxx_flags}",
             f"-DCMAKE_EXE_LINKER_FLAGS={linker_flags}",
@@ -711,7 +869,9 @@ class Builder:
         xmp_build_dir.mkdir(parents=True, exist_ok=True)
 
         # Key paths
-        expat_path = xmp_toolkit / "XMPCore" / "third-party" / "expat" / "public" / "lib"
+        expat_path = (
+            xmp_toolkit / "XMPCore" / "third-party" / "expat" / "public" / "lib"
+        )
         public_include = xmp_toolkit / "public" / "include"
 
         # Determine platform-specific defines and exclusions
@@ -862,23 +1022,33 @@ install(DIRECTORY {public_include}/ DESTINATION include/xmp
 
         # Configure and build
         cmake_args = [
-            "cmake", "-B", "build",
+            "cmake",
+            "-B",
+            "build",
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DCMAKE_INSTALL_PREFIX={self.config.deps_dir}",
+            # Force lib/ instead of lib64/ on Fedora/RHEL
+            "-DCMAKE_INSTALL_LIBDIR=lib",
         ]
         # Add -fPIC for position-independent code (required for shared library linking)
         pic_flag = "-fPIC"
         if cxx_flags:
             cmake_args.append(f"-DCMAKE_CXX_FLAGS={pic_flag} {cxx_flags}")
-            cmake_args.append(f"-DCMAKE_C_FLAGS={pic_flag} -I{prefix}/opt/llvm/include" if prefix else f"-DCMAKE_C_FLAGS={pic_flag}")
+            cmake_args.append(
+                f"-DCMAKE_C_FLAGS={pic_flag} -I{prefix}/opt/llvm/include"
+                if prefix
+                else f"-DCMAKE_C_FLAGS={pic_flag}"
+            )
         else:
             cmake_args.append(f"-DCMAKE_CXX_FLAGS={pic_flag}")
             cmake_args.append(f"-DCMAKE_C_FLAGS={pic_flag}")
         if linker_flags:
-            cmake_args.extend([
-                f"-DCMAKE_EXE_LINKER_FLAGS={linker_flags}",
-                f"-DCMAKE_SHARED_LINKER_FLAGS={linker_flags}",
-            ])
+            cmake_args.extend(
+                [
+                    f"-DCMAKE_EXE_LINKER_FLAGS={linker_flags}",
+                    f"-DCMAKE_SHARED_LINKER_FLAGS={linker_flags}",
+                ]
+            )
         # Remove empty args
         cmake_args = [arg for arg in cmake_args if arg]
 
@@ -977,9 +1147,13 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
         (src / "CMakeLists.txt").write_text(cmake_content, encoding="utf-8")
 
         cmake_args = [
-            "cmake", "-B", "build",
+            "cmake",
+            "-B",
+            "build",
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DCMAKE_INSTALL_PREFIX={self.config.deps_dir}",
+            # Force lib/ instead of lib64/ on Fedora/RHEL
+            "-DCMAKE_INSTALL_LIBDIR=lib",
         ]
         # Add -fPIC for position-independent code (required for shared library linking)
         pic_flag = "-fPIC"
@@ -988,10 +1162,12 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
         else:
             cmake_args.append(f"-DCMAKE_CXX_FLAGS={pic_flag}")
         if linker_flags:
-            cmake_args.extend([
-                f"-DCMAKE_EXE_LINKER_FLAGS={linker_flags}",
-                f"-DCMAKE_SHARED_LINKER_FLAGS={linker_flags}",
-            ])
+            cmake_args.extend(
+                [
+                    f"-DCMAKE_EXE_LINKER_FLAGS={linker_flags}",
+                    f"-DCMAKE_SHARED_LINKER_FLAGS={linker_flags}",
+                ]
+            )
 
         with contextlib.chdir(src):
             self.run(cmake_args)
@@ -1019,23 +1195,36 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
         # Add Homebrew paths if available (using llvm/libc++)
         prefix = self.brew_prefix
         if prefix is not None:
-            include_dirs.extend([
-                prefix / "opt" / "llvm" / "include" / "c++" / "v1",  # libc++ headers
-                prefix / "include",
-                prefix / "opt" / "jpeg-turbo" / "include",
-                prefix / "opt" / "zlib" / "include",
-            ])
-            lib_dirs.extend([
-                prefix / "opt" / "llvm" / "lib",  # libc++ library
-                prefix / "lib",
-                prefix / "opt" / "jpeg-turbo" / "lib",
-                prefix / "opt" / "zlib" / "lib",
-            ])
+            include_dirs.extend(
+                [
+                    prefix
+                    / "opt"
+                    / "llvm"
+                    / "include"
+                    / "c++"
+                    / "v1",  # libc++ headers
+                    prefix / "include",
+                    prefix / "opt" / "jpeg-turbo" / "include",
+                    prefix / "opt" / "zlib" / "include",
+                ]
+            )
+            lib_dirs.extend(
+                [
+                    prefix / "opt" / "llvm" / "lib",  # libc++ library
+                    prefix / "lib",
+                    prefix / "opt" / "jpeg-turbo" / "lib",
+                    prefix / "opt" / "zlib" / "lib",
+                ]
+            )
 
         # Build with clang and libc++ (always)
         # Need to define qLinux for DNG SDK headers and UNIX_ENV/XMP_UNIXBuild for XMP
         is_linux = sys.platform.startswith("linux")
-        platform_defines = "-DqLinux=1 -DUNIX_ENV=1 -DXMP_UNIXBuild=1" if is_linux else "-DqMacOS=1 -DMAC_ENV=1"
+        platform_defines = (
+            "-DqLinux=1 -DUNIX_ENV=1 -DXMP_UNIXBuild=1"
+            if is_linux
+            else "-DqMacOS=1 -DMAC_ENV=1"
+        )
         cxxflags = f"-stdlib=libc++ -O2 -DUSE_DNGSDK=1 {platform_defines}"
         libs = (
             "-lc++ -lomp "  # libc++ and LLVM OpenMP
@@ -1054,10 +1243,12 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
             "LDFLAGS": " ".join(f"-L{d}" for d in lib_dirs),
             "LIBS": libs,
             "PKG_CONFIG_PATH": ":".join(
-                p for p in [
+                p
+                for p in [
                     str(self.config.deps_dir / "lib" / "pkgconfig"),
                     os.environ.get("PKG_CONFIG_PATH", ""),
-                ] if p
+                ]
+                if p
             ),
             "CXXFLAGS": cxxflags,
             "LD_LIBRARY_PATH": ":".join(ld_lib_paths),
@@ -1065,14 +1256,17 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
 
         with contextlib.chdir(src):
             self.run(["autoreconf", "-fiv"])
-            self.run([
-                "./configure",
-                f"--prefix={self.config.install_prefix}",
-                "--enable-static",
-                "--disable-examples",
-                "--enable-jpeg",
-                "--enable-lcms",
-            ], env=env)
+            self.run(
+                [
+                    "./configure",
+                    f"--prefix={self.config.install_prefix}",
+                    "--enable-static",
+                    "--disable-examples",
+                    "--enable-jpeg",
+                    "--enable-lcms",
+                ],
+                env=env,
+            )
             self.run(["make", f"-j{self.config.jobs}"], env=env)
             self.run(["make", "install"], env=env)
 
@@ -1117,22 +1311,45 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
 
         # Platform defines needed for DNG SDK headers
         is_linux = sys.platform.startswith("linux")
-        platform_defines = ["-DqLinux=1", "-DUNIX_ENV=1", "-DXMP_UNIXBuild=1"] if is_linux else ["-DqMacOS=1", "-DMAC_ENV=1"]
+        platform_defines = (
+            ["-DqLinux=1", "-DUNIX_ENV=1", "-DXMP_UNIXBuild=1"]
+            if is_linux
+            else ["-DqMacOS=1", "-DMAC_ENV=1"]
+        )
 
         compile_cmd: list[str] = [
-            cxx, "-O2", "-DUSE_DNGSDK=1", *platform_defines,
+            cxx,
+            "-O2",
+            "-DUSE_DNGSDK=1",
+            *platform_defines,
         ]
         if cxx_stdlib_flag:
             compile_cmd.append(cxx_stdlib_flag)
-        compile_cmd.extend([
-            *(f"-I{p}" for p in all_includes),
-            "samples/dcraw_emu.cpp",
-            *(f"-L{p}" for p in all_libs),
-            "-lraw", "-ldng", "-lXMPCore", "-ljxl", "-ljxl_cms", "-ljxl_threads", "-lhwy",
-            "-lbrotlienc", "-lbrotlidec", "-lbrotlicommon",
-            "-ljpeg", "-llcms2", "-lz", "-lpthread", "-lm", *cxx_libs,
-            "-o", str(output_binary),
-        ])
+        compile_cmd.extend(
+            [
+                *(f"-I{p}" for p in all_includes),
+                "samples/dcraw_emu.cpp",
+                *(f"-L{p}" for p in all_libs),
+                "-lraw",
+                "-ldng",
+                "-lXMPCore",
+                "-ljxl",
+                "-ljxl_cms",
+                "-ljxl_threads",
+                "-lhwy",
+                "-lbrotlienc",
+                "-lbrotlidec",
+                "-lbrotlicommon",
+                "-ljpeg",
+                "-llcms2",
+                "-lz",
+                "-lpthread",
+                "-lm",
+                *cxx_libs,
+                "-o",
+                str(output_binary),
+            ]
+        )
 
         with contextlib.chdir(src):
             self.run(compile_cmd)
@@ -1152,9 +1369,9 @@ install(DIRECTORY source/ DESTINATION include/dng_sdk FILES_MATCHING PATTERN "*.
 
         c = _AnsiColor
         print(f"""
-{c.GREEN}{'=' * 50}{c.RESET}
+{c.GREEN}{"=" * 50}{c.RESET}
 {c.GREEN}{c.BOLD}Build successful!{c.RESET}
-{c.GREEN}{'=' * 50}{c.RESET}
+{c.GREEN}{"=" * 50}{c.RESET}
 
 {c.BOLD}Binary:{c.RESET} {binary}
 {c.BOLD}DNG SDK:{c.RESET} {self._dng_sdk_info}
@@ -1250,7 +1467,8 @@ Examples:
         help="Installation prefix (default: ./build)",
     )
     parser.add_argument(
-        "-j", "--jobs",
+        "-j",
+        "--jobs",
         type=int,
         default=None,
         metavar="N",
@@ -1267,7 +1485,8 @@ Examples:
         help="Prefer system package manager over Homebrew",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Enable verbose output",
     )
@@ -1293,10 +1512,10 @@ def main() -> None:
 
     c = _AnsiColor
     print(f"""
-{c.BOLD}{'=' * 50}
+{c.BOLD}{"=" * 50}
 LibRaw + DNG SDK Builder v{__version__}
 For iPhone 16/17 Pro JPEG-XL DNG support
-{'=' * 50}{c.RESET}
+{"=" * 50}{c.RESET}
 
 Build directory: {config.build_dir}
 Install prefix:  {config.install_prefix}
