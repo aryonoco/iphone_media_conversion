@@ -24,7 +24,9 @@ import exiftool
 FORMAT_EXTENSIONS = {
     "avif": [".avif"],
     "jxl": [".jxl"],
-    "all": [".avif", ".jxl"],
+    "png": [".png"],
+    "heic": [".heic"],
+    "all": [".avif", ".jxl", ".png", ".heic"],
 }
 
 
@@ -142,9 +144,9 @@ Examples:
     )
     parser.add_argument(
         "-f", "--format",
-        choices=["avif", "jxl", "all"],
+        choices=["avif", "jxl", "png", "heic", "all"],
         default="all",
-        help="Target format(s) to sync: avif, jxl, or all (default: all)"
+        help="Target format(s) to sync: avif, jxl, png, heic, or all (default: all)"
     )
     parser.add_argument(
         "-n", "--dry-run",
@@ -173,7 +175,7 @@ Examples:
 
     # Get target extensions based on format choice
     extensions = FORMAT_EXTENSIONS[args.format]
-    format_desc = args.format.upper() if args.format != "all" else "AVIF/JXL"
+    format_desc = args.format.upper() if args.format != "all" else "AVIF/JXL/PNG/HEIC"
 
     # Find pairs
     pairs = find_pairs(directory, extensions)
