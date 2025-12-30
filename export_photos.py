@@ -105,7 +105,7 @@ console = Console()
 # Global flags (set by argument parser)
 DEBUG_MODE: bool = False
 DEBUG_OUTPUT_DIR: Path | None = None
-PGTM_STRENGTH: float = 0.5  # Default: match Apple Photos rendering
+PGTM_STRENGTH: float = 1.0  # DNG SDK uses full strength (1.0)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -626,9 +626,10 @@ def _apply_profile_gain_table_map(
     # (DNG SDK dng_reference.cpp:3385 multiplies weight by exposureWeightGain)
     weight = np.clip(weight * baseline_exposure, 0.0, 1.0)
 
-    # Map weight (0-1) to table index (0 to N-1) for interpolation
-    # The interpolator axis is 0, 1, ..., N-1, so weight=1 should map to N-1
-    weight_idx = weight * (num_table_points - 1)
+    # Map weight (0-1) to table index per DNG SDK (dng_reference.cpp:3399):
+    # weightScaled = weight * tableSize (NOT tableSize-1)
+    # Then clamp index to valid range [0, tableSize-1]
+    weight_idx = weight * num_table_points
     weight_idx = np.clip(weight_idx, 0, num_table_points - 1)
 
     # Create pixel coordinates with half-pixel offset for center sampling
@@ -698,15 +699,21 @@ def _apply_profile_gain_table_map(
 def _compute_pgtm_gains(
     img: np.ndarray,
     pgtm: dict[str, Any],
+    baseline_exposure_ev: float = 0.0,
 ) -> np.ndarray:
     """Compute PGTM gains for a numpy array without applying or clipping.
 
     This function extracts the gain computation from _apply_profile_gain_table_map
     for use in HDR pipelines where we need gains without clipping.
 
+    Per DNG SDK (dng_reference.cpp:3375-3385), the weight is computed from
+    RAW pixel values and then scaled by 2^BaselineExposure before table lookup.
+
     Args:
-        img: Float32 array shape (H, W, 3), normalized 0-1 range (or higher for HDR).
+        img: Float32 array shape (H, W, 3), RAW linear values (before exposure).
         pgtm: Dictionary from _extract_profile_gain_table_map().
+        baseline_exposure_ev: BaselineExposure in EV stops. Weight is scaled
+            by 2^baseline_exposure_ev per DNG SDK.
 
     Returns:
         2D float32 array of scaled gains, shape (H, W).
@@ -738,11 +745,17 @@ def _compute_pgtm_gains(
         + input_weights[3] * rgb_min
         + input_weights[4] * rgb_max
     )
+    # Scale weight by baseline exposure per DNG SDK (dng_reference.cpp:3385)
+    # exposureWeightGain = pow(2.0, fBaselineExposure)
+    if baseline_exposure_ev != 0.0:
+        exposure_weight_gain = 2.0 ** baseline_exposure_ev
+        weight = weight * exposure_weight_gain
     # Clamp weight to valid table range (but don't clamp the pixel values)
     weight = np.clip(weight, 0.0, 1.0)
 
-    # Map weight to table index
-    weight_idx = weight * (num_table_points - 1)
+    # Map weight to table index per DNG SDK (dng_reference.cpp:3399):
+    # weightScaled = weight * tableSize (NOT tableSize-1)
+    weight_idx = weight * num_table_points
     weight_idx = np.clip(weight_idx, 0, num_table_points - 1)
 
     # Compute spatial coordinates
@@ -1353,34 +1366,46 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
         # Extract PGTM early so we can use it for both HDR and SDR paths
         pgtm = _extract_profile_gain_table_map(info.path)
 
-        # Compute HDR reference: exposure + PGTM without clipping
-        # This preserves highlight detail that would be lost in the SDR path
+        # Compute HDR reference: PGTM first (with exposure in weight), then exposure
+        # Per DNG SDK (dng_reference.cpp:3375-3404):
+        # 1. Compute weight from RAW pixels
+        # 2. Scale weight by 2^BaselineExposure
+        # 3. Look up gain from table
+        # 4. Apply gain to pixels
+        # 5. Then apply exposure multiplier
         exposure_mult = 2.0 ** baseline_exposure_ev
-        hdr_linear = dcraw_linear * exposure_mult  # No clipping!
 
         if pgtm:
-            # Apply PGTM gains without clipping
-            pgtm_gains = _compute_pgtm_gains(hdr_linear, pgtm)
-            hdr_linear = hdr_linear * pgtm_gains[:, :, np.newaxis]  # No clipping!
+            # Compute PGTM gains from RAW pixels with exposure scaling in weight
+            pgtm_gains = _compute_pgtm_gains(dcraw_linear, pgtm, baseline_exposure_ev)
+            hdr_linear = dcraw_linear * pgtm_gains[:, :, np.newaxis]  # No clipping!
+        else:
+            hdr_linear = dcraw_linear.copy()
+
+        # Apply exposure AFTER PGTM (DNG SDK order)
+        hdr_linear = hdr_linear * exposure_mult  # No clipping!
 
         # === SDR Path: Apply processing with clipping for display ===
-        # Phase 2: Apply exposure ramp (clips to [0, 1] for SDR display)
+        # DNG SDK order (dng_render.cpp): PGTM -> Exposure -> ToneCurve
+
+        # Phase 2: Apply ProfileGainTableMap FIRST (DNG SDK order)
+        # Weight is scaled by 2^BaselineExposure per dng_render.cpp:1887
+        if pgtm:
+            _apply_profile_gain_table_map(temp_ppm, pgtm, exposure_mult)
+
+        # Debug: Save post-PGTM output
+        _save_debug_stage(
+            temp_ppm, "02_pgtm", info.path.stem,
+            {"pgtm_applied": pgtm is not None, "weight_scale": exposure_mult}
+        )
+
+        # Phase 3: Apply exposure ramp AFTER PGTM (DNG SDK order)
         _apply_exposure_ramp(temp_ppm, baseline_exposure_ev)
 
         # Debug: Save post-exposure output
         _save_debug_stage(
-            temp_ppm, "02_exposure", info.path.stem,
+            temp_ppm, "03_exposure", info.path.stem,
             {"baseline_exposure_ev": baseline_exposure_ev, "multiplier": exposure_mult}
-        )
-
-        # Phase 3: Apply ProfileGainTableMap (clips for SDR display)
-        if pgtm:
-            _apply_profile_gain_table_map(temp_ppm, pgtm, 1.0)
-
-        # Debug: Save post-PGTM output
-        _save_debug_stage(
-            temp_ppm, "03_pgtm", info.path.stem,
-            {"pgtm_applied": pgtm is not None}
         )
 
         # Apply ProfileToneCurve to get SDR (Apple's rendering)
