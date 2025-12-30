@@ -786,6 +786,39 @@ def _compute_pgtm_gains(
     return scaled_gains
 
 
+def _convert_prophoto_to_rec2020(img: np.ndarray) -> np.ndarray:
+    """Convert linear ProPhoto RGB to linear Rec.2020.
+
+    ProPhoto RGB (RIMM/ROMM) is the DNG SDK's working color space.
+    This function converts to Rec.2020 for output encoding.
+
+    The matrix is derived by:
+    1. ProPhoto RGB → XYZ (D50 white point)
+    2. Bradford chromatic adaptation D50 → D65
+    3. XYZ → Rec.2020 (D65 white point)
+
+    Args:
+        img: Linear ProPhoto RGB image as float32 array (H, W, 3)
+
+    Returns:
+        Linear Rec.2020 image as float32 array (H, W, 3)
+    """
+    # Pre-computed ProPhoto RGB → Rec.2020 matrix
+    # Via XYZ with Bradford chromatic adaptation D50→D65
+    matrix = np.array([
+        [1.3459433, -0.2556075, -0.0511118],
+        [-0.0544599, 1.1124591, -0.0617249],
+        [0.0000000, 0.0000000, 1.2256520],
+    ], dtype=np.float32)
+
+    h, w, c = img.shape
+    flat = img.reshape(-1, 3)
+    converted = flat @ matrix.T
+    # Clip negative values (ProPhoto gamut is larger than Rec.2020)
+    converted = np.clip(converted, 0.0, None)
+    return converted.reshape(h, w, 3).astype(np.float32)
+
+
 def _build_tone_curve_lut(
     points: list[tuple[float, float]], bits: int = 16
 ) -> np.ndarray:
@@ -1340,7 +1373,7 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             "-6",        # 16-bit output
             "-q", "3",   # AHD demosaicing (high quality)
             "-H", "0",   # Clip highlights (exposure applied in Python)
-            "-o", "8",   # Output color space: Rec.2020 (for HDR pipeline)
+            "-o", "4",   # Output color space: ProPhoto RGB (DNG SDK working space)
             "-Z", str(temp_ppm),
             str(info.path),
         ]
@@ -1385,6 +1418,9 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
         # Apply exposure AFTER PGTM (DNG SDK order)
         hdr_linear = hdr_linear * exposure_mult  # No clipping!
 
+        # Convert HDR from ProPhoto to Rec.2020 (DNG SDK applies color matrix after processing)
+        hdr_linear = _convert_prophoto_to_rec2020(hdr_linear)
+
         # === SDR Path: Apply processing with clipping for display ===
         # DNG SDK order (dng_render.cpp): PGTM -> Exposure -> ToneCurve
 
@@ -1408,8 +1444,27 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             {"baseline_exposure_ev": baseline_exposure_ev, "multiplier": exposure_mult}
         )
 
-        # Apply ProfileToneCurve to get SDR (Apple's rendering)
-        # This creates the display-referred SDR version
+        # === GAIN MAP COMPUTATION (must be before tone curve) ===
+        # Read LINEAR SDR for gain map (both inputs must be linear per ISO 21496-1)
+        sdr_linear_prophoto, width, height = _read_ppm_as_float(temp_ppm)
+
+        # Convert SDR from ProPhoto to Rec.2020 (same color space as HDR for valid ratio)
+        sdr_linear_for_gainmap = _convert_prophoto_to_rec2020(sdr_linear_prophoto)
+
+        # Compute gain map from LINEAR SDR and LINEAR HDR
+        # The gain map captures the full dynamic range difference per ISO 21496-1
+        # Both inputs are now in linear Rec.2020 scene-referred space
+        gain_map, gain_metadata = compute_gain_map(sdr_linear_for_gainmap, hdr_linear)
+
+        # Debug: Save pre-tonecurve linear state
+        _save_debug_stage(
+            temp_ppm, "03b_linear_sdr", info.path.stem,
+            {"gain_min": gain_metadata["gain_map_min"], "gain_max": gain_metadata["gain_map_max"]}
+        )
+
+        # === DISPLAY ENCODING (after gain map) ===
+        # Apply ProfileToneCurve to create display-referred SDR
+        # This is the ONLY non-linear transform needed - it serves as the display encoding
         curve_points = _extract_tone_curve(info.path)
         if curve_points and len(curve_points) > 2:
             lut = _build_tone_curve_lut(curve_points)
@@ -1421,24 +1476,23 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
             {"tonecurve_applied": curve_points is not None and len(curve_points) > 2}
         )
 
-        # Read the tone-curved result (no longer linear - tone curve is non-linear)
-        sdr_tonemapped, _, _ = _read_ppm_as_float(temp_ppm)
+        # Read tone-curved SDR (still in ProPhoto, aesthetically shaped)
+        sdr_tonemapped_prophoto, _, _ = _read_ppm_as_float(temp_ppm)
 
-        # Compute gain map from true HDR (scene-referred, may exceed 1.0) and SDR
-        # The gain map captures the full dynamic range difference per ISO 21496-1
-        # hdr_linear: exposure + PGTM applied without clipping (true scene-referred)
-        # sdr_tonemapped: exposure + PGTM + tone curve with clipping (display-ready)
-        gain_map, gain_metadata = compute_gain_map(sdr_tonemapped, hdr_linear)
+        # Convert to Rec.2020 before display encoding (DNG SDK applies color matrix after processing)
+        sdr_tonemapped = _convert_prophoto_to_rec2020(sdr_tonemapped_prophoto)
 
-        # Apply sRGB gamma to SDR for display encoding
+        # Apply sRGB gamma for display encoding
+        # ProfileToneCurve is a TONE CURVE (aesthetic shaping), not a transfer function
+        # We still need sRGB gamma for perceptual encoding to display
         sdr_gamma = apply_srgb_gamma(sdr_tonemapped)
         _write_ppm_from_float(temp_sdr_ppm, sdr_gamma, width, height)
 
-        # Debug: Save final sRGB-encoded output (directly comparable to Apple Photos)
+        # Debug: Save final sRGB-encoded output
         if DEBUG_MODE and DEBUG_OUTPUT_DIR is not None:
             _save_debug_stage(
                 temp_sdr_ppm, "05_srgb_gamma", info.path.stem,
-                {"note": "sRGB encoded - comparable to Apple HEIC output"}
+                {"note": "sRGB encoded - tone curve + gamma for display"}
             )
 
         # Write gain map as PGM (8-bit grayscale)
