@@ -573,3 +573,6 @@ docker-compose.override.yaml
 ##################################
 # Project-specific               #
 ##################################
+
+# AVIF build artifacts (binaries, libs, etc.)
+avif_build/

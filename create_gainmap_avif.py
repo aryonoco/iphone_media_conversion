@@ -8,7 +8,7 @@
 # ///
 #
 # SPDX-License-Identifier: MPL-2.0
-# Copyright (c) 2025 Aryan Ameri
+# Copyright (c) 2025-2026 Aryan Ameri
 #
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -51,6 +51,7 @@ __all__: Final[list[str]] = [
     "ValidationError",
     "CombineError",
     "MetadataError",
+    "detect_cicp",
     "find_file_sets",
     "create_gainmap_avif",
     "transfer_metadata",
@@ -67,6 +68,29 @@ AVIFGAINMAPUTIL: Final[Path] = SCRIPT_DIR / "avif_build" / "bin" / "avifgainmapu
 
 # Console for rich output
 console = Console()
+
+
+# =============================================================================
+# CICP (Coding-Independent Code Points) Constants
+# =============================================================================
+
+# ISO/IEC 23091-2 color primaries
+CICP_PRIMARIES_BT709: Final[int] = 1
+CICP_PRIMARIES_UNSPECIFIED: Final[int] = 2
+CICP_PRIMARIES_BT2020: Final[int] = 9
+CICP_PRIMARIES_P3: Final[int] = 12
+
+# ISO/IEC 23091-2 transfer characteristics
+CICP_TRANSFER_UNSPECIFIED: Final[int] = 2
+CICP_TRANSFER_SRGB: Final[int] = 13
+CICP_TRANSFER_PQ: Final[int] = 16
+CICP_TRANSFER_HLG: Final[int] = 18
+
+# ISO/IEC 23091-2 matrix coefficients
+CICP_MATRIX_IDENTITY: Final[int] = 0
+CICP_MATRIX_BT709: Final[int] = 1
+CICP_MATRIX_UNSPECIFIED: Final[int] = 2
+CICP_MATRIX_BT2020: Final[int] = 9
 
 
 # =============================================================================
@@ -131,6 +155,70 @@ class ProcessingConfig:
 
 
 # =============================================================================
+# Colorspace Detection
+# =============================================================================
+
+
+def detect_cicp(avif_path: Path) -> str:
+    """
+    Detect CICP values from any AVIF file.
+
+    Uses numeric CICP codes (via exiftool -n) for reliable parsing.
+    Falls back to ICC profile for primaries when CICP is unspecified.
+    Works for both SDR and HDR files.
+
+    Returns: "primaries/transfer/matrix" string (e.g., "12/13/0")
+    """
+    with exiftool.ExifToolHelper() as et:
+        # Single call with -n: gives numeric CICP values, ICC ProfileDescription stays as string
+        meta = et.get_metadata(str(avif_path), params=["-n"])[0]
+
+    # Extract numeric CICP values (default to unspecified=2)
+    cicp_primaries = meta.get("QuickTime:ColorPrimaries", CICP_PRIMARIES_UNSPECIFIED)
+    cicp_transfer = meta.get("QuickTime:TransferCharacteristics", CICP_TRANSFER_UNSPECIFIED)
+    cicp_matrix = meta.get("QuickTime:MatrixCoefficients", CICP_MATRIX_UNSPECIFIED)
+
+    # ICC profile description remains a string even with -n flag
+    icc_profile = meta.get("ICC_Profile:ProfileDescription", "")
+
+    # --- Detect Primaries ---
+    if cicp_primaries not in (CICP_PRIMARIES_UNSPECIFIED, 0):
+        # Use explicit CICP value
+        primaries = cicp_primaries
+    elif "Display P3" in icc_profile or "P3" in icc_profile:
+        primaries = CICP_PRIMARIES_P3
+    elif "Rec. 2020" in icc_profile or "BT.2020" in icc_profile:
+        primaries = CICP_PRIMARIES_BT2020
+    elif "sRGB" in icc_profile:
+        primaries = CICP_PRIMARIES_BT709
+    else:
+        primaries = CICP_PRIMARIES_BT709  # Default
+
+    # --- Detect Transfer ---
+    if cicp_transfer not in (CICP_TRANSFER_UNSPECIFIED, 0):
+        # Use explicit CICP value
+        transfer = cicp_transfer
+    else:
+        # Default to sRGB for SDR-like content
+        transfer = CICP_TRANSFER_SRGB
+
+    # --- Detect Matrix ---
+    if cicp_matrix == CICP_MATRIX_IDENTITY:
+        # Explicit Identity (RGB data)
+        matrix = CICP_MATRIX_IDENTITY
+    elif cicp_matrix not in (CICP_MATRIX_UNSPECIFIED, 0):
+        # Use explicit CICP value
+        matrix = cicp_matrix
+    elif icc_profile:
+        # ICC profile present = likely RGB data = Identity matrix
+        matrix = CICP_MATRIX_IDENTITY
+    else:
+        matrix = CICP_MATRIX_BT709  # Default
+
+    return f"{primaries}/{transfer}/{matrix}"
+
+
+# =============================================================================
 # File Discovery
 # =============================================================================
 
@@ -192,10 +280,15 @@ def create_gainmap_avif(
     Combine SDR base + HDR alternate into ISO 21496-1 gain map AVIF.
 
     Uses avifgainmaputil combine with archival quality settings.
+    Dynamically detects colorspace from source files.
     Returns True on success, raises CombineError on failure.
     """
     if config.dry_run:
         return True
+
+    # Detect colorspace from source files
+    sdr_cicp = detect_cicp(sdr_avif)
+    hdr_cicp = detect_cicp(hdr_avif)
 
     cmd = [
         str(AVIFGAINMAPUTIL),
@@ -217,14 +310,13 @@ def create_gainmap_avif(
         "10",
         "--yuv-gain-map",
         "444",
-        "--ignore-profile",  # Ignore ICC profiles, use CICP values instead
-        # Set proper CICP color metadata for base (SDR) and alternate (HDR) images
-        # Base: BT.709 primaries (1), sRGB transfer (13), BT.709 matrix (1)
+        # avifgainmaputil doesn't support ICC profiles for gain map computation,
+        # so we must ignore them and rely on CICP values detected from source files
+        "--ignore-profile",
         "--cicp-base",
-        "1/13/1",
-        # Alternate: BT.2020 primaries (9), PQ transfer (16), BT.2020 matrix (9)
+        sdr_cicp,
         "--cicp-alternate",
-        "9/16/9",
+        hdr_cicp,
     ]
 
     try:
@@ -237,9 +329,7 @@ def create_gainmap_avif(
 
         if result.returncode != 0:
             error_msg = result.stderr or result.stdout or "Unknown error"
-            raise CombineError(
-                f"avifgainmaputil combine failed: {error_msg.strip()}"
-            )
+            raise CombineError(f"avifgainmaputil combine failed: {error_msg.strip()}")
 
         return True
 
@@ -328,7 +418,9 @@ def verify_output(avif_path: Path, verbose: bool = False) -> bool:
 
         # Check if output indicates gain map is present
         # The tool outputs "Gain Map Min:" when a gain map exists
-        has_gainmap = "Gain Map Min" in result.stdout or "Base headroom" in result.stdout
+        has_gainmap = (
+            "Gain Map Min" in result.stdout or "Base headroom" in result.stdout
+        )
 
         if verbose and result.stdout:
             console.print(f"[dim]{result.stdout.strip()}[/dim]")
@@ -426,8 +518,7 @@ def process_all(
 
         with ThreadPoolExecutor(max_workers=jobs) as executor:
             futures = {
-                executor.submit(process_file_set, fs, config): fs
-                for fs in file_sets
+                executor.submit(process_file_set, fs, config): fs for fs in file_sets
             }
 
             for future in as_completed(futures):
@@ -437,14 +528,10 @@ def process_all(
                     success_count += 1
                     if config.verbose:
                         status = "[dim][DRY RUN][/dim] " if config.dry_run else ""
-                        console.print(
-                            f"  {status}[green]✓[/green] {file_set.basename}"
-                        )
+                        console.print(f"  {status}[green]✓[/green] {file_set.basename}")
                 else:
                     failure_count += 1
-                    console.print(
-                        f"  [red]✗[/red] {file_set.basename}: {message}"
-                    )
+                    console.print(f"  [red]✗[/red] {file_set.basename}: {message}")
 
                 progress.advance(task)
 
@@ -588,7 +675,9 @@ def main() -> None:
     file_sets = find_file_sets(directory, output_dir)
 
     if not file_sets:
-        console.print(f"[yellow]No DNG/SDR-AVIF/HDR-AVIF triplets found in {directory}[/yellow]")
+        console.print(
+            f"[yellow]No DNG/SDR-AVIF/HDR-AVIF triplets found in {directory}[/yellow]"
+        )
         console.print("\nExpected files:")
         console.print("  IMG_XXXX.DNG")
         console.print("  IMG_XXXX.avif     (SDR)")

@@ -324,7 +324,10 @@ class Builder:
             llvm_include = prefix / "opt" / "llvm" / "include"
             llvm_lib = prefix / "opt" / "llvm" / "lib"
             cxx_flags = f"-stdlib=libc++ -I{llvm_include}/c++/v1"
-            linker_flags = f"-stdlib=libc++ -L{llvm_lib} -L{prefix}/lib"
+            linker_flags = (
+                f"-stdlib=libc++ -L{llvm_lib} -L{prefix}/lib "
+                f"-L{prefix}/opt/jpeg-turbo/lib"
+            )
 
         flags.extend([
             f"-DCMAKE_CXX_FLAGS={cxx_flags}",
@@ -548,36 +551,26 @@ class Builder:
         ]
         self.run(_privileged_cmd(["zypper", "-n", "install", *packages]))
 
-    def _get_git_root(self) -> Path:
-        """Get the root directory of the git repository."""
-        result = self.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=_get_script_dir(),
-        )
-        return Path(result.stdout.strip())
-
     def _clone_repo(self, name: str, url: str, tag: str) -> Path:
-        """Add or update a library as a git submodule."""
+        """Clone or update a library repository."""
         dest = self.config.sources_dir / name
-        git_root = self._get_git_root()
-        relative_path = dest.relative_to(git_root)
 
         if dest.exists():
-            self._logger.info("Using existing %s submodule", name)
+            self._logger.info("Using existing %s source", name)
             with contextlib.chdir(dest):
                 self.run(["git", "fetch", "--tags"], check=False)
                 self.run(["git", "checkout", tag], check=False)
         else:
-            self._logger.info("Adding %s as submodule (tag: %s)...", name, tag)
+            self._logger.info("Cloning %s (tag: %s)...", name, tag)
             self.config.sources_dir.mkdir(parents=True, exist_ok=True)
-            with contextlib.chdir(git_root):
+            with contextlib.chdir(self.config.sources_dir):
                 self.run([
-                    "git", "submodule", "add",
+                    "git", "clone",
+                    "--depth", "1",
+                    "--branch", tag,
                     url,
-                    str(relative_path),
+                    name,
                 ])
-            with contextlib.chdir(dest):
-                self.run(["git", "checkout", tag])
 
         return dest
 
@@ -609,12 +602,14 @@ class Builder:
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
             # Set RPATH so binaries find Homebrew/system libs at runtime
             f"-DCMAKE_INSTALL_RPATH={rpath}",
+            f"-DCMAKE_BUILD_RPATH={rpath}",
             "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON",
             # The key flag - builds avifenc, avifdec, avifgainmaputil
             "-DAVIF_BUILD_APPS=ON",
             "-DAVIF_BUILD_TESTS=OFF",
             # Use system libraries for everything
             "-DAVIF_CODEC_AOM=SYSTEM",
+            "-DAVIF_CODEC_SVT=OFF",
             "-DAVIF_CODEC_DAV1D=OFF",
             "-DAVIF_JPEG=SYSTEM",
             "-DAVIF_ZLIBPNG=SYSTEM",
