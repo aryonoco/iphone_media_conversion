@@ -101,7 +101,7 @@ console = Console()
 # Global flags (set by argument parser)
 DEBUG_MODE: bool = False
 DEBUG_OUTPUT_DIR: Path | None = None
-PGTM_STRENGTH: float = 1.0  # DNG SDK uses full strength (1.0)
+PGTM_STRENGTH: float = 0.5  # 0.5 matches Apple Photos rendering
 EXPOSURE_OFFSET: float = 0.0  # Additional exposure offset in EV
 
 
@@ -151,10 +151,10 @@ Examples:
     parser.add_argument(
         "--pgtm-strength",
         type=float,
-        default=1.0,
+        default=0.5,
         help=(
             "ProfileGainTableMap strength (0.0-1.0). Controls how strongly PGTM "
-            "local tone mapping is applied. 1.0 = full DNG spec (default: 1.0)"
+            "local tone mapping is applied. 0.5 matches Apple Photos (default: 0.5)"
         ),
     )
     parser.add_argument(
@@ -533,13 +533,17 @@ def _apply_profile_tone_curve(
     curve_inputs: np.ndarray,
     curve_outputs: np.ndarray,
 ) -> np.ndarray:
-    """Apply ProfileToneCurve to image data in a hue-preserving manner.
+    """Apply ProfileToneCurve using DNG SDK's RGBTone algorithm.
 
-    The tone curve is applied to luminance only, then all RGB channels are
-    scaled by the same ratio (new_luminance / old_luminance). This preserves
-    the original R:G:B ratios while still applying the curve's contrast.
+    This implements the hue-preserving tone curve from DNG SDK (dng_reference.cpp).
+    The algorithm:
+    1. For each pixel, identify max, mid, min RGB values
+    2. Apply curve to max and min independently
+    3. Interpolate mid: mid_out = min_out + (max_out - min_out) * (mid - min) / (max - min)
 
-    For HDR content (luminance > 1.0), the curve is extended linearly using
+    This preserves hue while applying proper contrast to each channel.
+
+    For HDR content (values > 1.0), the curve is extended linearly using
     the slope at the endpoint to preserve HDR headroom.
 
     Args:
@@ -558,29 +562,47 @@ def _apply_profile_tone_curve(
         curve_inputs[-1] - curve_inputs[-2] + 1e-10
     )
 
-    # Compute luminance from RGB (Rec.709 coefficients as perceptual approximation)
-    lum = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
+    def apply_curve(values: np.ndarray) -> np.ndarray:
+        """Apply tone curve with HDR linear extension."""
+        result = np.zeros_like(values)
+        # SDR range: use interpolated curve
+        sdr_mask = (values >= 0) & (values <= 1.0)
+        result[sdr_mask] = interp(values[sdr_mask])
+        # HDR range: linear extension
+        hdr_mask = values > 1.0
+        result[hdr_mask] = curve_outputs[-1] + endpoint_slope * (values[hdr_mask] - 1.0)
+        # Negative (shouldn't happen but be safe)
+        result[values < 0] = 0.0
+        return result
 
-    # Apply curve to luminance
-    lum_curved = np.zeros_like(lum)
+    h, w = img.shape[:2]
+    r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
 
-    # SDR range: use interpolated curve
-    sdr_mask = (lum >= 0) & (lum <= 1.0)
-    lum_curved[sdr_mask] = interp(lum[sdr_mask])
+    # Find max, mid, min for each pixel
+    rgb_stack = np.stack([r, g, b], axis=-1)
+    max_val = np.max(rgb_stack, axis=-1)
+    min_val = np.min(rgb_stack, axis=-1)
 
-    # HDR range: linear extension
-    hdr_mask = lum > 1.0
-    lum_curved[hdr_mask] = curve_outputs[-1] + endpoint_slope * (lum[hdr_mask] - 1.0)
+    # Apply curve to max and min
+    max_curved = apply_curve(max_val)
+    min_curved = apply_curve(min_val)
 
-    # Negative luminance (shouldn't happen but be safe)
-    lum_curved[lum < 0] = 0.0
+    # For mid values, interpolate based on position between min and max
+    # mid_out = min_out + (max_out - min_out) * (mid - min) / (max - min)
+    result = np.zeros_like(img)
 
-    # Scale RGB by luminance ratio to preserve hue
-    # Add small epsilon to avoid division by zero for black pixels
-    scale = lum_curved / (lum + 1e-10)
-    scale = scale[:, :, np.newaxis]  # Broadcast to (H, W, 1) for RGB
+    # Handle case where max == min (grayscale pixels)
+    gray_mask = (max_val - min_val) < 1e-10
 
-    result = img * scale
+    for i, channel in enumerate([r, g, b]):
+        # Compute normalized position of this channel between min and max
+        # t = (channel - min) / (max - min)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = np.where(gray_mask, 0.5, (channel - min_val) / (max_val - min_val + 1e-10))
+            t = np.clip(t, 0.0, 1.0)
+
+        # Interpolate: out = min_curved + t * (max_curved - min_curved)
+        result[:, :, i] = min_curved + t * (max_curved - min_curved)
 
     return result.astype(np.float32)
 
@@ -771,11 +793,12 @@ def _convert_prophoto_to_rec2020(img: np.ndarray) -> np.ndarray:
         Linear Rec.2020 image as float32 array (H, W, 3)
     """
     # Pre-computed ProPhoto RGB → Rec.2020 matrix
-    # Via XYZ with Bradford chromatic adaptation D50→D65
+    # Via: ProPhoto→XYZ(D50) → Bradford(D50→D65) → XYZ→Rec.2020(D65)
+    # Verified: neutral gray (0.5, 0.5, 0.5) maps to (0.5, 0.5, 0.5)
     matrix = np.array([
-        [1.3459433, -0.2556075, -0.0511118],
-        [-0.0544599, 1.1124591, -0.0617249],
-        [0.0000000, 0.0000000, 1.2256520],
+        [ 1.2006765, -0.0574641, -0.1431306],
+        [-0.0699240,  1.0805933, -0.0106823],
+        [ 0.0055355, -0.0407676,  1.0350179],
     ], dtype=np.float32)
 
     # Rec.2020 luminance coefficients (ITU-R BT.2020)
