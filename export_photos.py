@@ -4,7 +4,6 @@
 # dependencies = [
 #     "rich>=14.0",
 #     "numpy>=1.26",
-#     "scipy>=1.12",
 # ]
 # ///
 #
@@ -56,7 +55,6 @@ from pathlib import Path
 from typing import Final, Self
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator
 
 from rich.console import Console
 from rich.progress import (
@@ -79,7 +77,7 @@ SOURCE_DIR: str = "/var/home/admin/Pictures/iphone-orig"
 DESTINATION_DIR: str = "/var/home/admin/Pictures/script-output"
 
 # Parallel Processing
-MAX_WORKERS: int = 6  # Number of images to process simultaneously
+MAX_WORKERS: int = 1  # Number of images to process simultaneously
 
 # ═══════════════════════════════════════════════════════════════════
 #                        END CONFIGURATION
@@ -101,7 +99,7 @@ console = Console()
 # Global flags (set by argument parser)
 DEBUG_MODE: bool = False
 DEBUG_OUTPUT_DIR: Path | None = None
-PGTM_STRENGTH: float = 0.5  # 0.5 matches Apple Photos rendering
+PGTM_STRENGTH: float = 1.0  # 1.0 = SDK-correct (direct gain application)
 EXPOSURE_OFFSET: float = 0.0  # Additional exposure offset in EV
 
 
@@ -151,10 +149,10 @@ Examples:
     parser.add_argument(
         "--pgtm-strength",
         type=float,
-        default=0.5,
+        default=1.0,
         help=(
             "ProfileGainTableMap strength (0.0-1.0). Controls how strongly PGTM "
-            "local tone mapping is applied. 0.5 matches Apple Photos (default: 0.5)"
+            "local tone mapping is applied. 1.0 = SDK-correct (default: 1.0)"
         ),
     )
     parser.add_argument(
@@ -266,8 +264,12 @@ class ImageInfo:
 # ═══════════════════════════════════════════════════════════════════
 
 
-def validate_environment() -> None:
+def validate_environment(source_dir: Path, dest_dir: Path) -> None:
     """Validate required tools exist and directories are valid.
+
+    Args:
+        source_dir: Source directory path from arguments.
+        dest_dir: Destination directory path from arguments.
 
     Raises:
         ValidationError: If environment is invalid.
@@ -335,20 +337,17 @@ def validate_environment() -> None:
         raise ValidationError("dcraw_emu_dng timed out during validation")
 
     # Check directories
-    source = Path(SOURCE_DIR)
-    dest = Path(DESTINATION_DIR)
-
-    if not source.exists():
-        raise ValidationError(f"Source directory does not exist: {source}")
-    if not source.is_dir():
-        raise ValidationError(f"Source path is not a directory: {source}")
+    if not source_dir.exists():
+        raise ValidationError(f"Source directory does not exist: {source_dir}")
+    if not source_dir.is_dir():
+        raise ValidationError(f"Source path is not a directory: {source_dir}")
 
     # Create destination if needed
-    if not dest.exists():
-        dest.mkdir(parents=True, exist_ok=True)
-        console.print(f"[green]Created destination directory:[/] {dest}")
-    elif not dest.is_dir():
-        raise ValidationError(f"Destination path is not a directory: {dest}")
+    if not dest_dir.exists():
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"[green]Created destination directory:[/] {dest_dir}")
+    elif not dest_dir.is_dir():
+        raise ValidationError(f"Destination path is not a directory: {dest_dir}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -382,7 +381,7 @@ def _get_library_path() -> str:
 
     Libraries:
     - ./build/lib: libraw
-    - ./build/deps/lib64: libjxl, libbrotli, etc.
+    - ./build/deps/lib or lib64: libjxl, libbrotli, etc.
     - Homebrew LLVM: libc++, libomp (clang runtime)
 
     Returns:
@@ -396,7 +395,10 @@ def _get_library_path() -> str:
     if build_lib.exists():
         paths.append(str(build_lib))
 
-    # libjxl and dependencies
+    # libjxl and dependencies (try both lib and lib64)
+    deps_lib = script_dir / "build" / "deps" / "lib"
+    if deps_lib.exists():
+        paths.append(str(deps_lib))
     deps_lib64 = script_dir / "build" / "deps" / "lib64"
     if deps_lib64.exists():
         paths.append(str(deps_lib64))
@@ -528,6 +530,139 @@ def _extract_profile_tone_curve(dng_path: Path) -> tuple[np.ndarray, np.ndarray]
         return None
 
 
+def _solve_dng_spline(
+    x_points: np.ndarray,
+    y_points: np.ndarray,
+) -> np.ndarray:
+    """Compute C2-continuous spline slopes using DNG SDK algorithm.
+
+    Implements dng_spline_solver::Solve() from dng_spline.cpp:57-145.
+    This computes slopes at each control point such that the resulting
+    cubic Hermite spline is C0, C1, and C2 continuous with zero second
+    derivative at the endpoints.
+
+    Args:
+        x_points: Input x values (monotonically increasing).
+        y_points: Input y values.
+
+    Returns:
+        Array of slopes S[] at each control point.
+    """
+    count = len(x_points)
+    S = np.zeros(count, dtype=np.float64)
+
+    # Initial weighted average slopes
+    A = x_points[1] - x_points[0]
+    B = (y_points[1] - y_points[0]) / A
+    S[0] = B
+
+    for j in range(2, count):
+        C = x_points[j] - x_points[j - 1]
+        D = (y_points[j] - y_points[j - 1]) / C
+        S[j - 1] = (B * C + D * A) / (A + C)
+        A, B = C, D
+
+    S[count - 1] = 2.0 * B - S[count - 2]
+    S[0] = 2.0 * S[0] - S[1]
+
+    if count > 2:
+        # Tridiagonal solve for C2 continuity
+        E = np.zeros(count, dtype=np.float64)
+        F = np.zeros(count, dtype=np.float64)
+        G = np.zeros(count, dtype=np.float64)
+
+        F[0] = 0.5
+        E[count - 1] = 0.5
+        G[0] = 0.75 * (S[0] + S[1])
+        G[count - 1] = 0.75 * (S[count - 2] + S[count - 1])
+
+        for j in range(1, count - 1):
+            A = (x_points[j + 1] - x_points[j - 1]) * 2.0
+            E[j] = (x_points[j + 1] - x_points[j]) / A
+            F[j] = (x_points[j] - x_points[j - 1]) / A
+            G[j] = 1.5 * S[j]
+
+        for j in range(1, count):
+            A = 1.0 - F[j - 1] * E[j]
+            if j != count - 1:
+                F[j] /= A
+            G[j] = (G[j] - G[j - 1] * E[j]) / A
+
+        for j in range(count - 2, -1, -1):
+            G[j] = G[j] - F[j] * G[j + 1]
+
+        S = G
+
+    return S
+
+
+def _evaluate_spline_segment(
+    x: np.ndarray,
+    x0: float,
+    y0: float,
+    s0: float,
+    x1: float,
+    y1: float,
+    s1: float,
+) -> np.ndarray:
+    """Evaluate cubic Hermite spline segment.
+
+    Implements EvaluateSplineSegment from dng_spline.h:21-41.
+    Computes the 1-D Bezier with control values:
+        y0, y0 + s0*A, y1 - s1*A, y1
+
+    Args:
+        x: Input values (x0 <= x <= x1).
+        x0, y0, s0: Start point and slope.
+        x1, y1, s1: End point and slope.
+
+    Returns:
+        Interpolated y values.
+    """
+    A = x1 - x0
+    B = (x - x0) / A
+    C = (x1 - x) / A
+
+    D = ((y0 * (2.0 - C + B) + (s0 * A * B)) * (C * C)) + \
+        ((y1 * (2.0 - B + C) - (s1 * A * C)) * (B * B))
+
+    return D
+
+
+def _encode_overrange(x: np.ndarray) -> np.ndarray:
+    """Compress HDR values for table lookup.
+
+    Implements EncodeOverrange from dng_utils.h:1711-1718.
+    Maps [0, ∞) → [0, 1) with asymptote at 1.0.
+    At x=1: returns ~0.502 (allows full SDR range in lower half)
+    At x→∞: approaches 1.0
+
+    Args:
+        x: Linear values (may be > 1.0 for HDR).
+
+    Returns:
+        Encoded values in [0, 1) range.
+    """
+    x = np.maximum(x, 0.0)
+    return x * (256.0 + x) / (256.0 * (1.0 + x))
+
+
+def _decode_overrange(x: np.ndarray) -> np.ndarray:
+    """Expand encoded values back to HDR.
+
+    Implements DecodeOverrange from dng_utils.h:1722-1729.
+    Inverse of _encode_overrange.
+
+    Args:
+        x: Encoded values in [0, 1) range.
+
+    Returns:
+        Original HDR values.
+    """
+    x = np.maximum(x, 0.0)
+    return 16.0 * ((8.0 * x) - 8.0 + np.sqrt(64.0 * x * x - 127.0 * x + 64.0))
+
+
 def _apply_profile_tone_curve(
     img: np.ndarray,
     curve_inputs: np.ndarray,
@@ -543,8 +678,8 @@ def _apply_profile_tone_curve(
 
     This preserves hue while applying proper contrast to each channel.
 
-    For HDR content (values > 1.0), the curve is extended linearly using
-    the slope at the endpoint to preserve HDR headroom.
+    For HDR content (values > 1.0), the SDK uses EncodeOverrange/DecodeOverrange
+    to compress values into [0, 1) for lookup, then expand back.
 
     Args:
         img: Linear RGB image (H, W, 3), may contain values > 1.0 for HDR.
@@ -554,28 +689,43 @@ def _apply_profile_tone_curve(
     Returns:
         Tone-mapped image with curve applied, hue preserved.
     """
-    # Create interpolator for smooth curve
-    interp = PchipInterpolator(curve_inputs, curve_outputs, extrapolate=False)
-
-    # Get endpoint slope for HDR extension
-    endpoint_slope = (curve_outputs[-1] - curve_outputs[-2]) / (
-        curve_inputs[-1] - curve_inputs[-2] + 1e-10
-    )
+    # Solve for C2-continuous spline slopes (SDK algorithm)
+    slopes = _solve_dng_spline(curve_inputs.astype(np.float64),
+                                curve_outputs.astype(np.float64))
 
     def apply_curve(values: np.ndarray) -> np.ndarray:
-        """Apply tone curve with HDR linear extension."""
-        result = np.zeros_like(values)
-        # SDR range: use interpolated curve
-        sdr_mask = (values >= 0) & (values <= 1.0)
-        result[sdr_mask] = interp(values[sdr_mask])
-        # HDR range: linear extension
-        hdr_mask = values > 1.0
-        result[hdr_mask] = curve_outputs[-1] + endpoint_slope * (values[hdr_mask] - 1.0)
-        # Negative (shouldn't happen but be safe)
-        result[values < 0] = 0.0
+        """Apply tone curve with HDR overrange encode/decode."""
+        result = np.zeros_like(values, dtype=np.float64)
+
+        # Encode HDR values for lookup
+        encoded = _encode_overrange(values)
+
+        # Binary search to find segment for each value
+        # SDK uses binary search (dng_spline.cpp:184-202)
+        indices = np.searchsorted(curve_inputs, encoded, side='right')
+        indices = np.clip(indices, 1, len(curve_inputs) - 1)
+
+        # Evaluate spline for each segment
+        for j in range(1, len(curve_inputs)):
+            mask = indices == j
+            if not np.any(mask):
+                continue
+
+            x_vals = encoded[mask]
+            x0, y0, s0 = curve_inputs[j - 1], curve_outputs[j - 1], slopes[j - 1]
+            x1, y1, s1 = curve_inputs[j], curve_outputs[j], slopes[j]
+
+            result[mask] = _evaluate_spline_segment(x_vals, x0, y0, s0, x1, y1, s1)
+
+        # Handle values below first point
+        below_mask = encoded <= curve_inputs[0]
+        result[below_mask] = curve_outputs[0]
+
+        # Decode back to HDR range
+        result = _decode_overrange(result)
+
         return result
 
-    h, w = img.shape[:2]
     r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
 
     # Find max, mid, min for each pixel
@@ -700,8 +850,6 @@ def _compute_pgtm_gains(
     Returns:
         2D float32 array of scaled gains, shape (H, W).
     """
-    from scipy.interpolate import RegularGridInterpolator
-
     height, width = img.shape[:2]
 
     # Extract PGTM parameters
@@ -727,16 +875,12 @@ def _compute_pgtm_gains(
         + input_weights[3] * rgb_min
         + input_weights[4] * rgb_max
     )
-    # DNG SDK scales weight by 2^BaselineExposure, but this can cause weight
-    # saturation for extreme exposure images. We cap the scaling factor to
-    # prevent complete saturation while still adjusting for exposure level.
-    MAX_WEIGHT_SCALE = 4.0  # Cap at 2 EV of adjustment
+    # DNG SDK scales weight by 2^BaselineExposure, then clamps to [0, 1]
+    # No cap on the multiplier - SDK clamps weight after scaling (dng_reference.cpp:3381-3389)
     if baseline_exposure_ev != 0.0:
         exposure_weight_gain = 2.0 ** baseline_exposure_ev
-        # Cap the scaling to prevent saturation
-        exposure_weight_gain = min(exposure_weight_gain, MAX_WEIGHT_SCALE)
         weight = weight * exposure_weight_gain
-    # Clamp weight to valid table range (but don't clamp the pixel values)
+    # Clamp weight to valid table range per SDK: Pin_real32(0.0f, weight, 1.0f)
     weight = np.clip(weight, 0.0, 1.0)
 
     # Map weight to table index per DNG SDK (dng_reference.cpp:3399):
@@ -753,52 +897,82 @@ def _compute_pgtm_gains(
     col_coords = np.clip((u_image - origin_h) / spacing_h, 0, points_h - 1)
     row_grid, col_grid = np.meshgrid(row_coords, col_coords, indexing="ij")
 
-    # Build interpolator
-    v_axis = np.arange(points_v)
-    h_axis = np.arange(points_h)
-    n_axis = np.arange(num_table_points)
-    interp = RegularGridInterpolator(
-        (v_axis, h_axis, n_axis), table, method="linear",
-        bounds_error=False, fill_value=1.0,
-    )
+    # Trilinear interpolation using numpy (replaces scipy.RegularGridInterpolator)
+    # Get integer indices and fractional parts for all three dimensions
+    v_floor = np.floor(row_grid).astype(np.int32)
+    v_ceil = np.minimum(v_floor + 1, points_v - 1)
+    v_frac = row_grid - v_floor
+    v_floor = np.clip(v_floor, 0, points_v - 1)
 
-    # Interpolate gains
-    coords = np.stack([row_grid.ravel(), col_grid.ravel(), weight_idx.ravel()], axis=1)
-    gains = interp(coords).reshape(height, width)
+    h_floor = np.floor(col_grid).astype(np.int32)
+    h_ceil = np.minimum(h_floor + 1, points_h - 1)
+    h_frac = col_grid - h_floor
+    h_floor = np.clip(h_floor, 0, points_h - 1)
 
-    # Scale by PGTM_STRENGTH
-    scaled_gains = 1.0 + (gains - 1.0) * PGTM_STRENGTH
+    n_floor = np.floor(weight_idx).astype(np.int32)
+    n_ceil = np.minimum(n_floor + 1, num_table_points - 1)
+    n_frac = weight_idx - n_floor
+    n_floor = np.clip(n_floor, 0, num_table_points - 1)
+
+    # Get 8 corner values for trilinear interpolation: table[v, h, n]
+    c000 = table[v_floor, h_floor, n_floor]
+    c001 = table[v_floor, h_floor, n_ceil]
+    c010 = table[v_floor, h_ceil, n_floor]
+    c011 = table[v_floor, h_ceil, n_ceil]
+    c100 = table[v_ceil, h_floor, n_floor]
+    c101 = table[v_ceil, h_floor, n_ceil]
+    c110 = table[v_ceil, h_ceil, n_floor]
+    c111 = table[v_ceil, h_ceil, n_ceil]
+
+    # Trilinear interpolation
+    c00 = c000 * (1 - n_frac) + c001 * n_frac
+    c01 = c010 * (1 - n_frac) + c011 * n_frac
+    c10 = c100 * (1 - n_frac) + c101 * n_frac
+    c11 = c110 * (1 - n_frac) + c111 * n_frac
+
+    c0 = c00 * (1 - h_frac) + c01 * h_frac
+    c1 = c10 * (1 - h_frac) + c11 * h_frac
+
+    gains = c0 * (1 - v_frac) + c1 * v_frac
+
+    # Apply PGTM_STRENGTH: SDK applies gains directly when strength=1.0
+    # (dng_reference.cpp:3433-3437: r *= gain; g *= gain; b *= gain;)
+    if PGTM_STRENGTH == 1.0:
+        scaled_gains = gains  # Direct application, SDK-correct
+    else:
+        scaled_gains = 1.0 + (gains - 1.0) * PGTM_STRENGTH  # User-adjusted blend
 
     return scaled_gains
 
 
 def _convert_prophoto_to_rec2020(img: np.ndarray) -> np.ndarray:
-    """Convert linear ProPhoto RGB to linear Rec.2020 with gamut mapping.
+    """Convert linear ProPhoto RGB D65 to linear Rec.2020 with gamut mapping.
 
-    ProPhoto RGB (RIMM/ROMM) is the DNG SDK's working color space.
-    This function converts to Rec.2020 for output encoding.
+    LibRaw outputs ProPhoto RGB with D65 white point (not D50).
+    This function converts directly to Rec.2020 (also D65) without
+    chromatic adaptation since both color spaces use D65.
 
-    The matrix is derived by:
-    1. ProPhoto RGB → XYZ (D50 white point)
-    2. Bradford chromatic adaptation D50 → D65
-    3. XYZ → Rec.2020 (D65 white point)
+    The matrix is derived from LibRaw's colorconst.cpp matrices:
+    1. prophoto_rgb: ProPhoto RGB → XYZ (D65-adapted)
+    2. rec2020_rgb: Rec.2020 RGB → XYZ (D65)
+    3. Matrix = inv(rec2020_rgb) @ prophoto_rgb
 
     For out-of-gamut colors (negative RGB values after conversion), uses
     luminance-preserving desaturation toward neutral to maintain hue.
 
     Args:
-        img: Linear ProPhoto RGB image as float32 array (H, W, 3)
+        img: Linear ProPhoto RGB D65 image as float32 array (H, W, 3)
 
     Returns:
         Linear Rec.2020 image as float32 array (H, W, 3)
     """
-    # Pre-computed ProPhoto RGB → Rec.2020 matrix
-    # Via: ProPhoto→XYZ(D50) → Bradford(D50→D65) → XYZ→Rec.2020(D65)
-    # Verified: neutral gray (0.5, 0.5, 0.5) maps to (0.5, 0.5, 0.5)
+    # Direct ProPhoto D65 → Rec.2020 D65 matrix (no chromatic adaptation needed)
+    # Computed from LibRaw colorconst.cpp: inv(rec2020_to_xyz) @ prophoto_to_xyz
+    # Verified: gray (0.5, 0.5, 0.5) maps to (0.5, 0.5, 0.5), row sums ≈ 1.0
     matrix = np.array([
-        [ 1.2006765, -0.0574641, -0.1431306],
-        [-0.0699240,  1.0805933, -0.0106823],
-        [ 0.0055355, -0.0407676,  1.0350179],
+        [ 0.8198343,  0.0263074,  0.1538522],
+        [ 0.0453679,  0.9474589,  0.0071759],
+        [-0.0006235,  0.0377712,  0.9628510],
     ], dtype=np.float32)
 
     # Rec.2020 luminance coefficients (ITU-R BT.2020)
@@ -881,6 +1055,61 @@ def _scale_to_nits(linear_normalized: np.ndarray, sdr_white_nits: float = 203.0)
         Linear values in nits (0 to 10000+ range)
     """
     return linear_normalized * sdr_white_nits
+
+
+def _exposure_ramp(
+    x: np.ndarray,
+    white: float,
+    black: float = 0.0,
+    support_overrange: bool = True,
+) -> np.ndarray:
+    """Apply DNG SDK exposure ramp with quadratic shadow transition.
+
+    Implements dng_function_exposure_ramp from dng_render.cpp:50-103.
+    This provides smooth shadow rolloff instead of hard clipping.
+
+    For iPhone ProRAW with DefaultBlackRender=None, black=0.0 is SDK-correct
+    (see dng_render.cpp:2166-2169).
+
+    Args:
+        x: Linear pixel values (H, W, 3) or (H, W)
+        white: White point = 1.0 / 2^max(0, exposure)
+        black: Black point = 0.0 for iPhone ProRAW (SDK-correct)
+        support_overrange: If True, allow output > 1.0 for HDR
+
+    Returns:
+        Exposure-adjusted values with quadratic shadow transition
+    """
+    # Compute slope and transition radius per SDK
+    slope = 1.0 / (white - black) if white > black else 1.0
+
+    # Transition radius calculation (dng_render.cpp:65-75)
+    kMaxCurveX = 0.5      # Fraction of black
+    kMaxCurveY = 1.0 / 16.0  # Fraction of white
+
+    radius = min(kMaxCurveX * black, kMaxCurveY / slope) if black > 0 else 0.0
+    qscale = slope / (4.0 * radius) if radius > 0 else 0.0
+
+    result = np.zeros_like(x, dtype=np.float32)
+
+    # Region 1: Below black - radius → 0
+    mask1 = x <= (black - radius)
+    result[mask1] = 0.0
+
+    # Region 2: Above black + radius → linear
+    mask2 = x >= (black + radius)
+    y = (x[mask2] - black) * slope
+    if not support_overrange:
+        y = np.minimum(y, 1.0)
+    result[mask2] = y
+
+    # Region 3: Transition zone → quadratic (smooth shadow rolloff)
+    mask3 = ~mask1 & ~mask2
+    if np.any(mask3):
+        y = x[mask3] - (black - radius)
+        result[mask3] = qscale * y * y
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1148,9 +1377,12 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
         # Extract PGTM for local tone mapping
         pgtm = _extract_profile_gain_table_map(info.path)
 
-        # Compute exposure multiplier (BaselineExposure + optional offset)
+        # Compute exposure parameters (BaselineExposure + optional offset)
         total_exposure_ev = baseline_exposure_ev + EXPOSURE_OFFSET
-        exposure_mult = 2.0 ** total_exposure_ev
+        # For exposure ramp: white = 1.0 / 2^max(0, exposure) per dng_render.cpp:984
+        exposure_white = 1.0 / (2.0 ** max(0.0, total_exposure_ev))
+        # Black = 0.0 for iPhone ProRAW (DefaultBlackRender=None, SDK-correct)
+        exposure_black = 0.0
 
         # Phase 2: Apply ProfileGainTableMap (local tone mapping)
         # Per DNG SDK (dng_reference.cpp:3375-3404):
@@ -1168,17 +1400,23 @@ def process_dng_to_jxl(info: ImageInfo, dest_dir: Path) -> Path:
         _write_ppm_from_float(temp_ppm, hdr_linear, width, height)
         _save_debug_stage(
             temp_ppm, "02_pgtm", info.path.stem,
-            {"pgtm_applied": pgtm is not None, "weight_scale": exposure_mult}
+            {"pgtm_applied": pgtm is not None, "exposure_ev": total_exposure_ev}
         )
 
-        # Phase 3: Apply exposure AFTER PGTM (DNG SDK order)
-        hdr_linear = hdr_linear * exposure_mult
+        # Phase 3: Apply exposure ramp AFTER PGTM (DNG SDK order)
+        # Uses dng_function_exposure_ramp with quadratic shadow transition
+        hdr_linear = _exposure_ramp(
+            hdr_linear,
+            white=exposure_white,
+            black=exposure_black,
+            support_overrange=True,  # HDR output
+        )
 
         # Debug: Save post-exposure output
         _write_ppm_from_float(temp_ppm, np.clip(hdr_linear, 0, 1), width, height)
         _save_debug_stage(
             temp_ppm, "03_exposure", info.path.stem,
-            {"baseline_exposure_ev": baseline_exposure_ev, "multiplier": exposure_mult}
+            {"baseline_exposure_ev": baseline_exposure_ev, "white": exposure_white, "black": exposure_black}
         )
 
         # Phase 3.5: Apply ProfileToneCurve (global contrast)
@@ -1364,12 +1602,12 @@ def main() -> None:
 
     console.print("\n[bold]Photo Converter[/] (DNG to JXL + Image Copy)\n")
 
+    source_dir = args.source
+    dest_dir = args.dest
+
     try:
         # Validate environment
-        validate_environment()
-
-        source_dir = args.source
-        dest_dir = args.dest
+        validate_environment(source_dir, dest_dir)
 
         # Scan for images
         image_paths = scan_images(source_dir)

@@ -1,0 +1,15 @@
+[project]
+name = "iphone-media-conversion"
+version = "0.1.0"
+description = "Tools for converting iPhone media (DNG/JXL/AVIF)"
+readme = "LICENSE"
+requires-python = ">=3.12,<3.15"
+
+dependencies = [
+    "numpy",
+    "rich",
+    "scipy",
+]
+
+[tool.uv]
+managed = true
