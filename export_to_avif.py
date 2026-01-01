@@ -808,6 +808,50 @@ def _convert_prophoto_to_rec2020(img: NDArray[np.float32]) -> NDArray[np.float32
     return converted.reshape(h, w, 3).astype(np.float32)
 
 
+def _convert_prophoto_to_display_p3(img: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Convert linear ProPhoto RGB D65 to linear Display P3 with gamut mapping.
+
+    Matrix computed from CIE 1931 chromaticity coordinates:
+    - ProPhoto RGB primaries (D65 adapted): R(0.7347,0.2653) G(0.1596,0.8404) B(0.0366,0.0001)
+    - Display P3 primaries (D65): R(0.680,0.320) G(0.265,0.690) B(0.150,0.060)
+    - White point: D65 (0.3127, 0.3290)
+
+    Validated: white (1,1,1) -> (1,1,1), row sums = 1.0
+    """
+    matrix = np.array(
+        [
+            [1.6656413, -0.3301368, -0.3355045],
+            [-0.1490164, 1.1574112, -0.0083947],
+            [0.0064396, -0.0500168, 1.0435771],
+        ],
+        dtype=np.float32,
+    )
+
+    # Display P3 luminance coefficients (Y row of RGB->XYZ matrix)
+    lum_coeffs = np.array([0.228975, 0.691739, 0.079287], dtype=np.float32)
+
+    h, w, c = img.shape
+    flat = img.reshape(-1, 3)
+    converted = flat @ matrix.T
+
+    min_vals = np.min(converted, axis=1)
+    out_of_gamut = min_vals < 0
+
+    if np.any(out_of_gamut):
+        lum = (converted[out_of_gamut] @ lum_coeffs)[:, np.newaxis]
+        rgb_oog = converted[out_of_gamut]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            diff = lum - rgb_oog
+            t = np.where(diff > 0, lum / diff, 1.0)
+            t_max = np.min(np.where(rgb_oog < 0, t, 1.0), axis=1, keepdims=True)
+
+        converted[out_of_gamut] = lum + t_max * (rgb_oog - lum)
+        converted[out_of_gamut] = np.maximum(converted[out_of_gamut], 0.0)
+
+    return converted.reshape(h, w, 3).astype(np.float32)
+
+
 # ═══════════════════════════════════════════════════════════════════
 #                        TRANSFER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
@@ -1073,14 +1117,17 @@ def process_dng_to_avif(
     output_path = dest_dir / f"{info.path.stem}.avif"
 
     # Temp files (hidden, cleaned up in finally)
-    temp_linear_ppm = dest_dir / f".{info.path.stem}_linear.ppm"  # dcraw output (PPM)
+    # Dual decode: SDR with clipped highlights, HDR with preserved highlights
+    temp_linear_ppm_sdr = dest_dir / f".{info.path.stem}_linear_sdr.ppm"
+    temp_linear_ppm_hdr = dest_dir / f".{info.path.stem}_linear_hdr.ppm"
     temp_sdr_png = dest_dir / f".{info.path.stem}_sdr.png"  # For avifenc (PNG)
     temp_hdr_png = dest_dir / f".{info.path.stem}_hdr.png"  # For avifenc (PNG)
     temp_sdr_avif = dest_dir / f".{info.path.stem}_sdr.avif"
     temp_hdr_avif = dest_dir / f".{info.path.stem}_hdr.avif"
 
     temp_files = [
-        temp_linear_ppm,
+        temp_linear_ppm_sdr,
+        temp_linear_ppm_hdr,
         temp_sdr_png,
         temp_hdr_png,
         temp_sdr_avif,
@@ -1092,42 +1139,7 @@ def process_dng_to_avif(
 
     try:
         # ═══════════════════════════════════════════════════════════
-        # Phase 1: Decode DNG to linear ProPhoto RGB
-        # ═══════════════════════════════════════════════════════════
-
-        dcraw_cmd = [
-            str(DCRAW_EMU),
-            "-W",  # Disable auto-brightness
-            "-g",
-            "1",
-            "1",  # Linear output
-            "-dngsdk",  # Use DNG SDK for JXL decoding
-            "-6",  # 16-bit output
-            "-q",
-            "3",  # AHD demosaicing
-            "-H",
-            "0",  # Clip highlights
-            "-o",
-            "4",  # ProPhoto RGB
-            "-Z",
-            str(temp_linear_ppm),
-            str(info.path),
-        ]
-
-        result = subprocess.run(dcraw_cmd, capture_output=True, text=True, env=env)
-        if result.returncode != 0:
-            raise DngProcessingError(
-                f"dcraw_emu_dng failed: {result.stderr or result.stdout}"
-            )
-
-        if not temp_linear_ppm.exists():
-            raise DngProcessingError(f"dcraw_emu_dng produced no output for {info.path.name}")
-
-        # Read linear data
-        dcraw_linear, width, height = _read_ppm_as_float(temp_linear_ppm)
-
-        # ═══════════════════════════════════════════════════════════
-        # Phase 2: Extract DNG metadata and apply PGTM
+        # Phase 1: Extract DNG metadata
         # ═══════════════════════════════════════════════════════════
 
         baseline_exposure_ev = _get_baseline_exposure_ev(info.path)
@@ -1137,20 +1149,73 @@ def process_dng_to_avif(
         # Compute exposure parameters
         exposure_white = 1.0 / (2.0 ** max(0.0, baseline_exposure_ev))
 
-        # Apply PGTM (shared for both SDR and HDR)
-        if pgtm:
-            pgtm_gains = _compute_pgtm_gains(dcraw_linear, pgtm, baseline_exposure_ev)
-            pgtm_output = dcraw_linear * pgtm_gains[:, :, np.newaxis]
-        else:
-            pgtm_output = dcraw_linear.copy()
+        # ═══════════════════════════════════════════════════════════
+        # Phase 2: Dual Decode - SDR and HDR with different highlight handling
+        # ═══════════════════════════════════════════════════════════
+
+        # SDR decode: -H 0 clips highlights (standard SDR rendering)
+        dcraw_cmd_sdr = [
+            str(DCRAW_EMU),
+            "-W",  # Disable auto-brightness
+            "-g", "1", "1",  # Linear output
+            "-dngsdk",  # Use DNG SDK for JXL decoding
+            "-6",  # 16-bit output
+            "-q", "3",  # AHD demosaicing
+            "-H", "0",  # Clip highlights for SDR
+            "-o", "4",  # ProPhoto RGB
+            "-Z", str(temp_linear_ppm_sdr),
+            str(info.path),
+        ]
+
+        # HDR decode: -H 1 preserves highlights for HDR headroom
+        dcraw_cmd_hdr = [
+            str(DCRAW_EMU),
+            "-W",  # Disable auto-brightness
+            "-g", "1", "1",  # Linear output
+            "-dngsdk",  # Use DNG SDK for JXL decoding
+            "-6",  # 16-bit output
+            "-q", "3",  # AHD demosaicing
+            "-H", "1",  # Unclip highlights for HDR
+            "-o", "4",  # ProPhoto RGB
+            "-Z", str(temp_linear_ppm_hdr),
+            str(info.path),
+        ]
+
+        # Run both decodes
+        result_sdr = subprocess.run(dcraw_cmd_sdr, capture_output=True, text=True, env=env)
+        if result_sdr.returncode != 0:
+            raise DngProcessingError(
+                f"dcraw_emu_dng (SDR) failed: {result_sdr.stderr or result_sdr.stdout}"
+            )
+
+        result_hdr = subprocess.run(dcraw_cmd_hdr, capture_output=True, text=True, env=env)
+        if result_hdr.returncode != 0:
+            raise DngProcessingError(
+                f"dcraw_emu_dng (HDR) failed: {result_hdr.stderr or result_hdr.stdout}"
+            )
+
+        if not temp_linear_ppm_sdr.exists():
+            raise DngProcessingError(f"dcraw_emu_dng produced no SDR output for {info.path.name}")
+        if not temp_linear_ppm_hdr.exists():
+            raise DngProcessingError(f"dcraw_emu_dng produced no HDR output for {info.path.name}")
 
         # ═══════════════════════════════════════════════════════════
-        # Phase 3: SDR Branch
+        # Phase 3: SDR Branch (full tone mapping pipeline)
         # ═══════════════════════════════════════════════════════════
+
+        # Read SDR linear data (highlights clipped)
+        dcraw_linear_sdr, width, height = _read_ppm_as_float(temp_linear_ppm_sdr)
+
+        # Apply PGTM for SDR (local tone mapping for SDR contrast)
+        if pgtm:
+            pgtm_gains = _compute_pgtm_gains(dcraw_linear_sdr, pgtm, baseline_exposure_ev)
+            sdr_pgtm_output = dcraw_linear_sdr * pgtm_gains[:, :, np.newaxis]
+        else:
+            sdr_pgtm_output = dcraw_linear_sdr.copy()
 
         # Exposure ramp with clipping (SDR path)
         sdr_linear = _exposure_ramp(
-            pgtm_output,
+            sdr_pgtm_output,
             white=exposure_white,
             black=0.0,
             support_overrange=False,
@@ -1163,37 +1228,35 @@ def process_dng_to_avif(
                 sdr_linear, curve_inputs, curve_outputs
             )
 
-        # Convert to Rec.2020
-        sdr_rec2020 = _convert_prophoto_to_rec2020(sdr_linear)
+        # Convert to Display P3
+        sdr_p3 = _convert_prophoto_to_display_p3(sdr_linear)
 
         # Apply sRGB gamma
-        sdr_encoded = _apply_srgb_gamma(sdr_rec2020)
+        sdr_encoded = _apply_srgb_gamma(sdr_p3)
 
         # Write SDR PNG (16-bit lossless)
         _write_png_from_float(temp_sdr_png, sdr_encoded)
 
         # ═══════════════════════════════════════════════════════════
-        # Phase 4: HDR Branch
+        # Phase 4: HDR Branch (simplified - preserve full dynamic range)
         # ═══════════════════════════════════════════════════════════
 
-        # Exposure ramp preserving HDR values
-        hdr_linear = _exposure_ramp(
-            pgtm_output,
-            white=exposure_white,
-            black=0.0,
-            support_overrange=True,
-        )
+        # Read HDR linear data (highlights preserved via -H 1)
+        dcraw_linear_hdr, _, _ = _read_ppm_as_float(temp_linear_ppm_hdr)
 
-        # Apply tone curve (HDR version - with overrange)
-        if tone_curve:
-            hdr_linear = _apply_profile_tone_curve(
-                hdr_linear, curve_inputs, curve_outputs
-            )
+        # Skip PGTM for HDR - it's designed for SDR local contrast
+        # Apply exposure compensation directly to preserve HDR headroom
+        exposure_gain = 2.0 ** baseline_exposure_ev
+        hdr_linear = dcraw_linear_hdr * exposure_gain
 
-        # Convert to Rec.2020
+        # Skip tone curve for HDR - preserve linear response in highlights
+        # The S-curve would compress our HDR headroom
+
+        # Convert to Rec.2020 (preserves values > 1.0)
         hdr_rec2020 = _convert_prophoto_to_rec2020(hdr_linear)
 
         # Scale to nits and apply PQ
+        # Values > 1.0 will exceed 203 nits, giving proper HDR headroom
         hdr_nits = _scale_to_nits(hdr_rec2020, sdr_white_nits=203.0)
         hdr_pq = _apply_pq_oetf(hdr_nits)
 
@@ -1204,7 +1267,7 @@ def process_dng_to_avif(
         # Phase 5: Encode AVIFs
         # ═══════════════════════════════════════════════════════════
 
-        # Encode SDR AVIF (8-bit, CICP 9/13/0)
+        # Encode SDR AVIF (8-bit, CICP 12/13/0 = Display P3 + sRGB)
         sdr_cmd = [
             str(AVIFENC),
             "--depth",
@@ -1212,7 +1275,7 @@ def process_dng_to_avif(
             "--yuv",
             "444",
             "--cicp",
-            "9/13/0",
+            "12/13/0",
             "-q",
             str(quality),
             "-s",
@@ -1230,7 +1293,7 @@ def process_dng_to_avif(
         if result.returncode != 0:
             raise AvifEncodingError(f"SDR avifenc failed: {result.stderr or result.stdout}")
 
-        # Encode HDR AVIF (10-bit, CICP 9/16/0)
+        # Encode HDR AVIF (10-bit, CICP 9/16/9 = BT.2020 + PQ + BT.2020 matrix)
         hdr_cmd = [
             str(AVIFENC),
             "--depth",
@@ -1238,7 +1301,7 @@ def process_dng_to_avif(
             "--yuv",
             "444",
             "--cicp",
-            "9/16/0",
+            "9/16/9",
             "-q",
             str(quality),
             "-s",
@@ -1277,15 +1340,14 @@ def process_dng_to_avif(
             "-y",
             "444",
             "--depth-gain-map",
-            "8",
+            "10",
             "--yuv-gain-map",
-            "400",
-            "--downscaling",
-            "2",
+            "444",
+            "--ignore-profile",
             "--cicp-base",
-            "9/13/0",
+            "12/13/0",
             "--cicp-alternate",
-            "9/16/0",
+            "9/16/9",
         ]
 
         result = subprocess.run(combine_cmd, capture_output=True, text=True, env=env)
