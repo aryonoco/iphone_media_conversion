@@ -404,6 +404,7 @@ db.sqlite3-journal
 .claude/
 .anthropic/
 CLAUDE.md
+AGENTS.md
 
 # OpenAI / GPT
 .openai/
