@@ -852,6 +852,50 @@ def _convert_prophoto_to_display_p3(img: NDArray[np.float32]) -> NDArray[np.floa
     return converted.reshape(h, w, 3).astype(np.float32)
 
 
+def _convert_rec2020_to_display_p3(img: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Convert linear Rec.2020 to linear Display P3 with gamut mapping.
+
+    Matrix computed from:
+    - Rec.2020 primaries: R(0.708,0.292) G(0.170,0.797) B(0.131,0.046)
+    - Display P3 primaries: R(0.680,0.320) G(0.265,0.690) B(0.150,0.060)
+    - White point: D65 (0.3127, 0.3290)
+
+    This is the inverse of P3→Rec.2020 matrix. Row sums = 1.0 for white preservation.
+    """
+    matrix = np.array(
+        [
+            [1.22494018, -0.22494018, 0.0],
+            [-0.04205695, 1.04205695, 0.0],
+            [-0.01963755, -0.07863605, 1.0982736],
+        ],
+        dtype=np.float32,
+    )
+
+    # Display P3 luminance coefficients (Y row of RGB->XYZ matrix)
+    lum_coeffs = np.array([0.228975, 0.691739, 0.079287], dtype=np.float32)
+
+    h, w, c = img.shape
+    flat = img.reshape(-1, 3)
+    converted = flat @ matrix.T
+
+    min_vals = np.min(converted, axis=1)
+    out_of_gamut = min_vals < 0
+
+    if np.any(out_of_gamut):
+        lum = (converted[out_of_gamut] @ lum_coeffs)[:, np.newaxis]
+        rgb_oog = converted[out_of_gamut]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            diff = lum - rgb_oog
+            t = np.where(diff > 0, lum / diff, 1.0)
+            t_max = np.min(np.where(rgb_oog < 0, t, 1.0), axis=1, keepdims=True)
+
+        converted[out_of_gamut] = lum + t_max * (rgb_oog - lum)
+        converted[out_of_gamut] = np.maximum(converted[out_of_gamut], 0.0)
+
+    return converted.reshape(h, w, 3).astype(np.float32)
+
+
 # ═══════════════════════════════════════════════════════════════════
 #                        TRANSFER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
@@ -1154,15 +1198,18 @@ def process_dng_to_avif(
         # ═══════════════════════════════════════════════════════════
 
         # SDR decode: -H 0 clips highlights (standard SDR rendering)
+        # -M disables embedded color matrix (ProRAW is already Rec.2020)
+        # -o 8 outputs Rec.2020 colorspace directly
         dcraw_cmd_sdr = [
             str(DCRAW_EMU),
             "-W",  # Disable auto-brightness
             "-g", "1", "1",  # Linear output
             "-dngsdk",  # Use DNG SDK for JXL decoding
             "-6",  # 16-bit output
-            "-q", "3",  # AHD demosaicing
+            "-q", "3",  # AHD interpolation
             "-H", "0",  # Clip highlights for SDR
-            "-o", "4",  # ProPhoto RGB
+            "-M",  # Disable embedded color matrix (ProRAW is already Rec.2020)
+            "-o", "8",  # Output Rec.2020 (not ProPhoto)
             "-Z", str(temp_linear_ppm_sdr),
             str(info.path),
         ]
@@ -1174,9 +1221,10 @@ def process_dng_to_avif(
             "-g", "1", "1",  # Linear output
             "-dngsdk",  # Use DNG SDK for JXL decoding
             "-6",  # 16-bit output
-            "-q", "3",  # AHD demosaicing
+            "-q", "3",  # AHD interpolation
             "-H", "1",  # Unclip highlights for HDR
-            "-o", "4",  # ProPhoto RGB
+            "-M",  # Disable embedded color matrix (ProRAW is already Rec.2020)
+            "-o", "8",  # Output Rec.2020 (not ProPhoto)
             "-Z", str(temp_linear_ppm_hdr),
             str(info.path),
         ]
@@ -1201,9 +1249,10 @@ def process_dng_to_avif(
 
         # ═══════════════════════════════════════════════════════════
         # Phase 3: SDR Branch (full tone mapping pipeline)
+        # Data is Rec.2020 linear (ProRAW native colorspace)
         # ═══════════════════════════════════════════════════════════
 
-        # Read SDR linear data (highlights clipped)
+        # Read SDR linear data (Rec.2020, highlights clipped via -H 0)
         dcraw_linear_sdr, width, height = _read_ppm_as_float(temp_linear_ppm_sdr)
 
         # Apply PGTM for SDR (local tone mapping for SDR contrast)
@@ -1228,8 +1277,8 @@ def process_dng_to_avif(
                 sdr_linear, curve_inputs, curve_outputs
             )
 
-        # Convert to Display P3
-        sdr_p3 = _convert_prophoto_to_display_p3(sdr_linear)
+        # Convert Rec.2020 → Display P3 (data is already Rec.2020 from dcraw)
+        sdr_p3 = _convert_rec2020_to_display_p3(sdr_linear)
 
         # Apply sRGB gamma
         sdr_encoded = _apply_srgb_gamma(sdr_p3)
@@ -1239,9 +1288,10 @@ def process_dng_to_avif(
 
         # ═══════════════════════════════════════════════════════════
         # Phase 4: HDR Branch (simplified - preserve full dynamic range)
+        # Data is Rec.2020 linear (ProRAW native colorspace) - no conversion needed
         # ═══════════════════════════════════════════════════════════
 
-        # Read HDR linear data (highlights preserved via -H 1)
+        # Read HDR linear data (Rec.2020, highlights preserved via -H 1)
         dcraw_linear_hdr, _, _ = _read_ppm_as_float(temp_linear_ppm_hdr)
 
         # Skip PGTM for HDR - it's designed for SDR local contrast
@@ -1252,8 +1302,8 @@ def process_dng_to_avif(
         # Skip tone curve for HDR - preserve linear response in highlights
         # The S-curve would compress our HDR headroom
 
-        # Convert to Rec.2020 (preserves values > 1.0)
-        hdr_rec2020 = _convert_prophoto_to_rec2020(hdr_linear)
+        # Data is already Rec.2020 linear from dcraw (no conversion needed)
+        hdr_rec2020 = hdr_linear
 
         # Scale to nits and apply PQ
         # Values > 1.0 will exceed 203 nits, giving proper HDR headroom
